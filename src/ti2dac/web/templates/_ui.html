@@ -60,7 +60,7 @@
 {%- set s = (s or "")|string -%}
 {%- if s in ("approved", "pass", "syntax-validated", "done", "applied", "ok", "fired", "quiet", "true_positive") or s.startswith("tested") -%}ok
 {%- elif s in ("failed", "fail", "rejected", "interrupted", "invalid", "not_fired", "false_positive", "critical", "high", "auth_error", "quota_exhausted", "daily_cap", "TLP:RED") -%}bad
-{%- elif s in ("draft", "open", "running", "reviewed", "medium", "rate_limited", "refused", "TLP:AMBER", "TLP:AMBER+STRICT", "benign_true_positive") -%}warn
+{%- elif s in ("draft", "open", "running", "reviewed", "medium", "rate_limited", "refused", "unavailable", "TLP:AMBER", "TLP:AMBER+STRICT", "benign_true_positive") -%}warn
 {%- elif s in ("TLP:GREEN",) -%}ok
 {%- else -%}muted{%- endif -%}
 {%- endmacro %}

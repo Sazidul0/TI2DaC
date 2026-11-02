@@ -1,0 +1,176 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1060" viewBox="0 0 1600 1060">
+  <defs>
+    <linearGradient id="header" x1="0" x2="1">
+      <stop offset="0" stop-color="#102a43"/>
+      <stop offset="1" stop-color="#1f4e79"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="3" stdDeviation="4" flood-opacity=".18"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 z" fill="#486581"/>
+    </marker>
+    <style>
+      .title { font: 700 30px Arial, sans-serif; fill: #fff; }
+      .subtitle { font: 16px Arial, sans-serif; fill: #d9e2ec; }
+      .section { font: 700 17px Arial, sans-serif; fill: #102a43; }
+      .box-title { font: 700 16px Arial, sans-serif; fill: #102a43; }
+      .box-text { font: 14px Arial, sans-serif; fill: #243b53; }
+      .small { font: 13px Arial, sans-serif; fill: #486581; }
+      .arrow-label { font: 13px Arial, sans-serif; fill: #334e68; }
+      .ai { fill: #fff4cc; stroke: #d99e00; }
+      .code { fill: #e8f1f8; stroke: #2f80b7; }
+      .human { fill: #e5f5ec; stroke: #2f855a; }
+      .external { fill: #f7e8ef; stroke: #b83280; }
+      .output { fill: #f0eafa; stroke: #805ad5; }
+      .risk { fill: #fff1f0; stroke: #c53030; }
+      .line { stroke: #486581; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .dashed { stroke-dasharray: 9 7; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1060" fill="#f5f7fa"/>
+  <rect x="0" y="0" width="1600" height="100" fill="url(#header)"/>
+  <text x="55" y="45" class="title">ti2dac — Threat Intelligence to Detection-as-Code</text>
+  <text x="55" y="75" class="subtitle">From report intake to validated, reviewed, multi-SIEM detection package</text>
+
+  <text x="55" y="135" class="section">1. Intake and protection</text>
+  <rect x="55" y="155" width="220" height="115" rx="12" class="external" filter="url(#shadow)"/>
+  <text x="75" y="185" class="box-title">Report / evidence</text>
+  <text x="75" y="211" class="box-text">HTML, PDF, DOCX, EML,</text>
+  <text x="75" y="232" class="box-text">Markdown, URL, EVTX/JSON</text>
+  <text x="75" y="253" class="small">Public TI or internal incident</text>
+
+  <rect x="330" y="155" width="230" height="115" rx="12" class="code" filter="url(#shadow)"/>
+  <text x="350" y="185" class="box-title">Ingest and fingerprint</text>
+  <text x="350" y="211" class="box-text">Normalize text and metadata</text>
+  <text x="350" y="232" class="box-text">Preserve source + SHA-256</text>
+  <text x="350" y="253" class="small">ingest.py</text>
+
+  <rect x="615" y="155" width="230" height="115" rx="12" class="code" filter="url(#shadow)"/>
+  <text x="635" y="185" class="box-title">TLP gate and redact</text>
+  <text x="635" y="211" class="box-text">Policy check before AI</text>
+  <text x="635" y="232" class="box-text">Pseudonymize sensitive values</text>
+  <text x="635" y="253" class="small">redact.py + config</text>
+
+  <rect x="900" y="155" width="230" height="115" rx="12" class="code" filter="url(#shadow)"/>
+  <text x="920" y="185" class="box-title">Condense and extract IOCs</text>
+  <text x="920" y="211" class="box-text">Keep behavioral paragraphs</text>
+  <text x="920" y="232" class="box-text">Separate indicators from TTPs</text>
+  <text x="920" y="253" class="small">condense.py + iocs.py</text>
+
+  <line x1="275" y1="212" x2="330" y2="212" class="line"/>
+  <line x1="560" y1="212" x2="615" y2="212" class="line"/>
+  <line x1="845" y1="212" x2="900" y2="212" class="line"/>
+  <text x="287" y="198" class="arrow-label">load</text>
+  <text x="572" y="198" class="arrow-label">protect</text>
+  <text x="857" y="198" class="arrow-label">trim</text>
+
+  <text x="55" y="330" class="section">2. AI-assisted analysis and deterministic inspection</text>
+  <rect x="55" y="350" width="285" height="145" rx="12" class="ai" filter="url(#shadow)"/>
+  <text x="78" y="382" class="box-title">AI analysis — call 1</text>
+  <text x="78" y="408" class="box-text">Extract attacker behaviors</text>
+  <text x="78" y="429" class="box-text">Evidence quotes, ATT&amp;CK IDs,</text>
+  <text x="78" y="450" class="box-text">observables, log sources, scores</text>
+  <text x="78" y="475" class="small">Claude / Gemini; structured JSON</text>
+
+  <rect x="400" y="350" width="285" height="145" rx="12" class="code" filter="url(#shadow)"/>
+  <text x="423" y="382" class="box-title">Verify, rank and select</text>
+  <text x="423" y="408" class="box-text">Verify quotes against source</text>
+  <text x="423" y="429" class="box-text">Validate ATT&amp;CK mapping</text>
+  <text x="423" y="450" class="box-text">Rank observability and FP risk</text>
+  <text x="423" y="475" class="small">pipeline.py + attack.py + quality.py</text>
+
+  <rect x="745" y="350" width="285" height="145" rx="12" class="ai" filter="url(#shadow)"/>
+  <text x="768" y="382" class="box-title">AI generation — per behavior</text>
+  <text x="768" y="408" class="box-text">Sigma rule and telemetry needs</text>
+  <text x="768" y="429" class="box-text">Safe simulation and cleanup</text>
+  <text x="768" y="450" class="box-text">Tests, ADS and triage guidance</text>
+  <text x="768" y="475" class="small">One request per selected behavior</text>
+
+  <rect x="1090" y="350" width="455" height="145" rx="12" class="code" filter="url(#shadow)"/>
+  <text x="1113" y="382" class="box-title">Inspect, repair and self-test</text>
+  <text x="1113" y="408" class="box-text">Sigma parse/validation, safety lint, brittleness</text>
+  <text x="1113" y="429" class="box-text">Positive and negative unit events, duplicate hints</text>
+  <text x="1113" y="450" class="box-text">Repair only when needed; warnings remain visible</text>
+  <text x="1113" y="475" class="small">sigma_tools.py + safety.py + replay.py</text>
+
+  <line x1="340" y1="422" x2="400" y2="422" class="line"/>
+  <line x1="685" y1="422" x2="745" y2="422" class="line"/>
+  <line x1="1030" y1="422" x2="1090" y2="422" class="line"/>
+  <line x1="1015" y1="270" x2="200" y2="350" class="line dashed"/>
+  <text x="520" y="305" class="arrow-label">redacted condensed text only</text>
+  <text x="1120" y="315" class="arrow-label">repair loop, max configured attempts</text>
+
+  <rect x="1120" y="525" width="380" height="70" rx="12" class="external" filter="url(#shadow)"/>
+  <text x="1143" y="555" class="box-title">External AI provider</text>
+  <text x="1143" y="578" class="box-text">Claude API / Gemini API — no raw incident logs</text>
+  <line x1="1170" y1="495" x2="1240" y2="525" class="line dashed"/>
+
+  <text x="55" y="555" class="section">3. Conversion, evidence and packaging</text>
+  <rect x="55" y="575" width="300" height="145" rx="12" class="code" filter="url(#shadow)"/>
+  <text x="78" y="607" class="box-title">Sigma → native SIEM queries</text>
+  <text x="78" y="633" class="box-text">Splunk, Elastic, Sentinel, Defender,</text>
+  <text x="78" y="654" class="box-text">CrowdStrike, QRadar, OpenSearch, Loki</text>
+  <text x="78" y="679" class="box-text">Field mappings and backend warnings</text>
+  <text x="78" y="702" class="small">pySigma; AI only for configured gaps</text>
+
+  <rect x="410" y="575" width="300" height="145" rx="12" class="code" filter="url(#shadow)"/>
+  <text x="433" y="607" class="box-title">Replay real evidence</text>
+  <text x="433" y="633" class="box-text">Lab or incident events stay local</text>
+  <text x="433" y="654" class="box-text">Record match/no-match outcomes</text>
+  <text x="433" y="679" class="box-text">Build validation matrix</text>
+  <text x="433" y="702" class="small">replay.py + test records</text>
+
+  <rect x="765" y="575" width="300" height="145" rx="12" class="output" filter="url(#shadow)"/>
+  <text x="788" y="607" class="box-title">Detection package</text>
+  <text x="788" y="633" class="box-text">Rules, queries, simulations, tests</text>
+  <text x="788" y="654" class="box-text">Telemetry, ADS, ATT&amp;CK layer</text>
+  <text x="788" y="679" class="box-text">Summary, provenance, warnings</text>
+  <text x="788" y="702" class="small">output/&lt;run-id&gt;/</text>
+
+  <rect x="1120" y="625" width="380" height="95" rx="12" class="code" filter="url(#shadow)"/>
+  <text x="1143" y="657" class="box-title">Local state and audit memory</text>
+  <text x="1143" y="682" class="box-text">SQLite feedback, lessons, tests, users, jobs</text>
+  <text x="1143" y="705" class="small">feedback.py + users.py + aistatus.py</text>
+
+  <line x1="1090" y1="570" x2="355" y2="635" class="line"/>
+  <line x1="1090" y1="570" x2="710" y2="635" class="line"/>
+  <line x1="1090" y1="570" x2="765" y2="635" class="line"/>
+  <line x1="1065" y1="665" x2="1120" y2="670" class="line"/>
+
+  <text x="55" y="780" class="section">4. Human validation and handover</text>
+  <rect x="55" y="800" width="300" height="125" rx="12" class="human" filter="url(#shadow)"/>
+  <text x="78" y="832" class="box-title">Analyst review and lab test</text>
+  <text x="78" y="858" class="box-text">Inspect warnings, run simulation,</text>
+  <text x="78" y="879" class="box-text">test positive and benign activity</text>
+  <text x="78" y="905" class="small">Record evidence, not assumptions</text>
+
+  <rect x="410" y="800" width="300" height="125" rx="12" class="human" filter="url(#shadow)"/>
+  <text x="433" y="832" class="box-title">Feedback and correction</text>
+  <text x="433" y="858" class="box-text">Fix rule as a new version</text>
+  <text x="433" y="879" class="box-text">Store lessons and audit actions</text>
+  <text x="433" y="905" class="small">Never silently overwrite v1</text>
+
+  <rect x="765" y="800" width="300" height="125" rx="12" class="human" filter="url(#shadow)"/>
+  <text x="788" y="832" class="box-title">Four-eyes approval</text>
+  <text x="788" y="858" class="box-text">Approver must differ from author</text>
+  <text x="788" y="879" class="box-text">Only approved rules are exported</text>
+  <text x="788" y="905" class="small">draft → reviewed → approved</text>
+
+  <rect x="1120" y="800" width="380" height="125" rx="12" class="output" filter="url(#shadow)"/>
+  <text x="1143" y="832" class="box-title">Detection Git repository / CI</text>
+  <text x="1143" y="858" class="box-text">Rules, tests, queries and docs exported</text>
+  <text x="1143" y="879" class="box-text">CI validates on pull requests</text>
+  <text x="1143" y="905" class="small">Deployment remains the company’s pipeline</text>
+
+  <line x1="355" y1="862" x2="410" y2="862" class="line"/>
+  <line x1="710" y1="862" x2="765" y2="862" class="line"/>
+  <line x1="1065" y1="862" x2="1120" y2="862" class="line"/>
+  <line x1="915" y1="720" x2="205" y2="800" class="line dashed"/>
+  <text x="410" y="760" class="arrow-label">human evidence required</text>
+
+  <rect x="55" y="965" width="1445" height="55" rx="10" class="risk"/>
+  <text x="80" y="989" class="box-title">Handover gate:</text>
+  <text x="205" y="989" class="box-text">Do not treat generated output as production-ready until real SIEM validation, security review, access controls, backups, monitoring, and an incident-response process are completed.</text>
+</svg>

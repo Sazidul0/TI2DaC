@@ -11,6 +11,7 @@ States per provider:
   daily_cap        our own `ai.daily_request_limit` reached; resets at local midnight
   auth_error       key missing/invalid; blocked until reset
   refused          the model declined a request (informational; does not block)
+  unavailable      provider down/overloaded after retries (informational; does not block)
 """
 from __future__ import annotations
 

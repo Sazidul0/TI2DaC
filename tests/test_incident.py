@@ -85,7 +85,7 @@ def test_tlp_detection_and_policy(settings, incident_file):
 def test_incident_end_to_end_nothing_sensitive_reaches_the_model(settings, incident_file, monkeypatch):
     _isettings(settings)
     fake = FakeLLM(settings, bad_first=False)
-    monkeypatch.setattr(pipeline, "LLM", lambda s, *a: fake)
+    monkeypatch.setattr(pipeline, "LLM", lambda s, *a, **k: fake)
     store = Store(settings.db_path)
     record, loaded = pipeline.run(str(incident_file), settings, store=store, explicit=["B1"], actor="alice")
     assert record.report.kind == "incident" and record.report.tlp_effective == "amber"
@@ -112,7 +112,7 @@ def test_tlp_override_is_audited(settings, incident_file, monkeypatch):
     _isettings(settings)
     settings.ai.provider = "gemini"
     fake = FakeLLM(settings, bad_first=False)
-    monkeypatch.setattr(pipeline, "LLM", lambda s, *a: fake)
+    monkeypatch.setattr(pipeline, "LLM", lambda s, *a, **k: fake)
     store = Store(settings.db_path)
     record, _ = pipeline.run(str(incident_file), settings, store=store, explicit=["B1"], actor="alice",
                              tlp_override="synthetic training report, approved by CISO")
@@ -136,7 +136,7 @@ def test_rule_with_placeholder_is_repaired(settings, report_file, monkeypatch):
             return super().structured(stage, system, user, schema)
 
     fake = HostSpecific(settings)
-    monkeypatch.setattr(pipeline, "LLM", lambda s, *a: fake)
+    monkeypatch.setattr(pipeline, "LLM", lambda s, *a, **k: fake)
     record, _ = pipeline.run(str(report_file), settings, store=Store(settings.db_path))
     task = next(p for p in record.packages if p.behaviour.technique_id == "T1053.005")
     assert "[HOST_1]" not in task.rule_yaml and task.repair_attempts >= 1

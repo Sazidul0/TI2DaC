@@ -299,8 +299,13 @@ class Usage(BaseModel):
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
-    by_stage: dict[str, dict[str, int | str]] = {}
+    # Per stage: calls, tokens, cost_usd (priced at the model that actually answered), model_price_key (last model).
+    by_stage: dict[str, dict[str, int | float | str]] = {}
     estimated_cost_usd: float = 0.0
+    fallback_calls: int = 0          # answered by Anthropic's server-side refusal fallback model
+    failover_calls: int = 0          # answered by ai.failover_provider during a primary-provider outage
+    schema_retries: int = 0          # corrective re-asks after a response failed schema validation
+    unpriced_models: list[str] = []  # models with no known price: their tokens are not in estimated_cost_usd
 
 
 class RunRecord(BaseModel):

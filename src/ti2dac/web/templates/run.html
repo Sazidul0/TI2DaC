@@ -44,8 +44,9 @@
   {{ ui.stat("SIEM queries", ns.q_ok, "database", "warn" if ns.q_ok < ns.q_all else "", sub=("of " ~ ns.q_all) if ns.q_all else "",
              hint="converted across all rules" if ns.q_all else "") }}
   {% if r.usage.calls or r.usage.cached_calls %}
-  {{ ui.stat("AI cost", "$" ~ ("%.4f"|format(r.usage.estimated_cost_usd or 0)), "ai",
-             hint=(r.usage.calls ~ " calls · " ~ ((r.usage.input_tokens + r.usage.output_tokens)|tok) ~ " tokens")) }}
+  {{ ui.stat("AI cost", ("not priced" if r.usage.unpriced_models and not r.usage.estimated_cost_usd
+                         else "$" ~ ("%.4f"|format(r.usage.estimated_cost_usd or 0))), "ai",
+             hint=(r.usage.calls ~ " calls · " ~ ((r.usage.input_tokens + r.usage.output_tokens + r.usage.cache_read_tokens + r.usage.cache_write_tokens)|tok) ~ " tokens")) }}
   {% endif %}
 </div>
 
@@ -76,20 +77,28 @@
         {% if r.usage.calls or r.usage.cached_calls %}<dt>AI usage</dt><dd>{{ r.usage.calls }} calls ({{ r.usage.cached_calls }} served from cache, free) ·
           in {{ "{:,}".format(r.usage.input_tokens) }} / out {{ "{:,}".format(r.usage.output_tokens) }} tokens
           {% if r.usage.cache_read_tokens %}· cache read {{ "{:,}".format(r.usage.cache_read_tokens) }}{% endif %}
-          · est. ${{ "%.4f"|format(r.usage.estimated_cost_usd or 0) }}{% if r.ai_provider %} · {{ r.ai_provider }}{% endif %}</dd>{% endif %}
+          {% if r.usage.cache_write_tokens %}· cache write {{ "{:,}".format(r.usage.cache_write_tokens) }}{% endif %}
+          · est. ${{ "%.4f"|format(r.usage.estimated_cost_usd or 0) }}{% if r.ai_provider %} · {{ r.ai_provider }}{% endif %}
+          {% if r.usage.unpriced_models %}<div class="xs muted">No price known for {{ r.usage.unpriced_models|join(", ") }}: its tokens are not in the estimate (set <code>ai.prices</code>).</div>{% endif %}
+          {% if r.usage.fallback_calls or r.usage.failover_calls or r.usage.schema_retries %}<div class="xs muted">
+            {%- if r.usage.fallback_calls %}{{ r.usage.fallback_calls }} answered by the refusal-fallback model. {% endif %}
+            {%- if r.usage.failover_calls %}{{ r.usage.failover_calls }} answered by the failover provider. {% endif %}
+            {%- if r.usage.schema_retries %}{{ r.usage.schema_retries }} schema re-ask(s).{% endif %}</div>{% endif %}</dd>{% endif %}
       </dl>
       {% if r.usage.by_stage %}
       <details class="plain"><summary>{{ ui.icon("chevron-right", "sm chev") }}AI token usage by stage</summary>
         <div class="table-wrap" style="margin-top:10px;border:1px solid var(--border);border-radius:var(--radius)"><table class="table compact">
-          <thead><tr><th>Stage</th><th>Model</th><th class="num">Calls</th><th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cache read</th></tr></thead>
+          <thead><tr><th>Stage</th><th>Model</th><th class="num">Calls</th><th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cache read</th><th class="num">Cache write</th><th class="num">Est. cost</th></tr></thead>
           <tbody>{% for stage, u in r.usage.by_stage.items() %}<tr><td>{{ stage }}</td><td><code>{{ u.model_price_key }}</code></td><td class="num">{{ u.calls }}</td>
             <td class="num">{{ u.cached_calls }}</td><td class="num">{{ "{:,}".format(u.input_tokens) }}</td><td class="num">{{ "{:,}".format(u.output_tokens) }}</td>
-            <td class="num">{{ "{:,}".format(u.cache_read_tokens) }}</td></tr>{% endfor %}</tbody>
+            <td class="num">{{ "{:,}".format(u.cache_read_tokens) }}</td><td class="num">{{ "{:,}".format(u.cache_write_tokens or 0) }}</td>
+            <td class="num">{{ ("$%.4f"|format(u.cost_usd)) if u.cost_usd is defined else "–" }}</td></tr>{% endfor %}</tbody>
           <tfoot><tr><td>Total</td><td></td><td class="num">{{ r.usage.calls }}</td><td class="num">{{ r.usage.cached_calls }}</td><td class="num">{{ "{:,}".format(r.usage.input_tokens) }}</td>
-            <td class="num">{{ "{:,}".format(r.usage.output_tokens) }}</td><td class="num">{{ "{:,}".format(r.usage.cache_read_tokens) }}</td></tr></tfoot>
+            <td class="num">{{ "{:,}".format(r.usage.output_tokens) }}</td><td class="num">{{ "{:,}".format(r.usage.cache_read_tokens) }}</td><td class="num">{{ "{:,}".format(r.usage.cache_write_tokens) }}</td>
+            <td class="num">${{ "%.4f"|format(r.usage.estimated_cost_usd or 0) }}</td></tr></tfoot>
         </table></div>
         <p class="xs muted" style="margin-top:8px">Output tokens include the model's thinking. Analyse = 1 call per report; generate = 1 per rule;
-          repair/translate only when needed. Cached calls cost nothing.</p>
+          repair/translate only when needed. Cached calls cost nothing. Costs are priced at the model that actually answered.</p>
       </details>
       {% endif %}
     </div>

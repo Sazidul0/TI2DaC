@@ -78,11 +78,26 @@ ai:
   default_tlp_threat_intel: clear # for unmarked documents
   default_tlp_incident: amber
   server_side_fallback: true     # re-run a declined request on Anthropic's recommended fallback model
+  failover_provider: ""          # e.g. gemini: used only while the primary is down, and only if allowed_tlp permits
+  failover_model: ""             # "" = gemini_model for gemini, claude-opus-5-5 for anthropic
+  prices: {}                     # USD per 1M tokens for unpriced models: {model-id: [input, output, cache_read]}
   max_repair_attempts: 2
   input_token_budget: 6000       # report is condensed to ~this many tokens before analysis
   max_behaviours: 10
   response_cache: true           # identical request => served from .ti2dac/cache, zero tokens
   max_lessons_in_prompt: 5
+
+log:                             # operational logs: JSON lines, metadata only (never report text, prompts or keys)
+  level: INFO
+  dir: ""                        # "" = .ti2dac/logs (ti2dac-web.jsonl for the server, ti2dac-cli.jsonl for commands)
+  max_mb: 10                     # rotate at this size; 0 = no log file
+  backups: 5                     # rotated files kept
+  json_stderr: false             # also JSON on stderr (containers, journald)
+  syslog: ""                     # forward to your SIEM: udp://siem.example:514, tcp://host:514 or /dev/log
+
+health:                          # /healthz and `ti2dac health`
+  min_free_mb: 1024              # warn below this free disk space; fail below a quarter of it
+  stuck_job_minutes: 60
 
 fetch:
   allow_urls: true

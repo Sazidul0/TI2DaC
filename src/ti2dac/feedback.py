@@ -11,10 +11,13 @@ Follows common detection-engineering practice:
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from . import obs
 
 ARTIFACTS = ["behaviour", "attack_mapping", "sigma_rule", "query", "telemetry", "simulation", "ads", "other"]
 CATEGORIES = {
@@ -95,10 +98,28 @@ class Store:
         finally:
             conn.close()
 
-    def audit(self, actor: str, action: str, details: dict) -> None:
+    def audit(self, actor: str, action: str, details: dict, level: int = logging.INFO) -> None:
+        """Audit trail in the database, mirrored as an `audit` event to the log stream (and from there a SIEM)."""
         with self._conn() as c:
             c.execute("INSERT INTO audit_log(ts, actor, action, details) VALUES (?,?,?,?)",
                       (_now(), actor, action, json.dumps(details, ensure_ascii=False)))
+        obs.event("audit", level, action=action, actor=actor,
+                  details={k: (v[:300] if isinstance(v, str) else v) for k, v in details.items()})
+
+    def health(self) -> tuple[bool, str]:
+        try:
+            with self._conn() as c:
+                result = c.execute("PRAGMA quick_check").fetchone()[0]
+                c.execute("SELECT count(*) FROM audit_log").fetchone()
+        except sqlite3.Error as e:
+            return False, f"{type(e).__name__}: {e}"
+        return result == "ok", "ok" if result == "ok" else f"quick_check: {result}"
+
+    def stuck_jobs(self, minutes: int) -> list[dict]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        with self._conn() as c:
+            return [dict(r) for r in c.execute("SELECT id, created_at, label FROM jobs WHERE status='running' AND created_at < ?",
+                                               (cutoff,))]
 
     # ------------------------------------------------------------------ runs / packages
     def register_run(self, record, path: str) -> None:

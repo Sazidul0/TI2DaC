@@ -6,7 +6,7 @@
 <div class="page-head">
   <div class="titles">
     <h1>AI provider</h1>
-    <p class="subtitle">Which model ti2dac uses, its API keys, how much it has used, and whether requests are currently allowed.</p>
+    <p class="subtitle">Which provider and model ti2dac uses, its API keys, how much it has used, and whether requests are currently allowed.</p>
   </div>
   {% if ai.state != 'ok' and role == 'admin' %}
   <div class="actions"><form method="post" action="/ai/reset"><button class="btn outline">{{ ui.icon("refresh", "sm") }}Clear pause (after fixing the cause)</button></form></div>
@@ -73,6 +73,58 @@
   </div>
 </section>
 
+<section class="card" id="models" style="margin-bottom:16px" aria-labelledby="models-title">
+  <div class="card-head"><div><h2 id="models-title">{{ ui.icon("ai") }}Model</h2>
+    <p class="desc">Which provider and model ti2dac uses. Saved in the server's <code>.ti2dac/ai_models.json</code> (overrides <code>ti2dac.yaml</code>);
+      jobs started after saving use it, no restart needed.{% if model_choice.updated_by %} Last changed by {{ model_choice.updated_by }}, {{ model_choice.updated_at[:16]|replace("T", " ") }} UTC.{% endif %}</p></div></div>
+  {% if model_locks %}<div class="issues" style="margin:0 20px 4px"><div class="alert warn">{{ ui.icon("alert") }}<div><div class="alert-title">{{ model_locks|join(" and ") }} {{ "is" if model_locks|length == 1 else "are" }} set in the server environment</div>
+    That overrides the choice here. Remove it where ti2dac is started (or from <code>.env</code>) to manage the model on this page.</div></div></div>{% endif %}
+  <div class="card-body flush">
+  {% for b in model_blocks %}
+    <div class="keyrow">
+      <div class="row" style="justify-content:space-between">
+        <div class="row" style="gap:8px"><b>{{ b.label }}</b>{% if b.active %}<span class="badge primary">active provider</span>{% endif %}</div>
+        <span class="xs muted">{% if b.fetched_at %}Models this key can use, listed {{ b.fetched_at }} UTC{% else %}Built-in model list{% endif %}</span>
+      </div>
+      {% if b.msg %}<div class="alert {{ 'ok' if b.msg.ok else 'bad' }}" style="margin-top:12px" role="status">
+        {{ ui.icon("check-circle" if b.msg.ok else "x") }}<div style="min-width:0;word-break:break-word">{{ b.msg.message }}
+        <span class="xs muted">· {{ b.msg.by }} at {{ b.msg.at }}</span></div></div>{% endif %}
+      {% if role == "admin" %}
+      <form method="post" action="/ai/models" style="margin-top:12px">
+        <input type="hidden" name="provider" value="{{ b.provider }}">
+        <label class="field"><span>Model for every stage</span>
+          <select class="select" name="model">{% for m in b.models %}<option value="{{ m.id }}" {{ 'selected' if m.id == b.main }}>{{ m.name }} · {{ m.price }}{% if m.unlisted %} · not in this key's list{% endif %}</option>{% endfor %}</select></label>
+        <details class="plain" style="margin-top:10px" {{ 'open' if b.stages.values()|select|list }}>
+          <summary>{{ ui.icon("chevron-right", "sm chev") }}Different model per stage</summary>
+          <div class="form-grid" style="margin-top:10px">
+          {% for st in stages %}<label class="field"><span>{{ st|capitalize }} <span class="help">· effort {{ b.effort[st] }}</span></span>
+            <select class="select sm" name="stage_{{ st }}"><option value="">Same as above</option>{% for m in b.models %}<option value="{{ m.id }}" {{ 'selected' if m.id == b.stages[st] }}>{{ m.name }}</option>{% endfor %}</select></label>{% endfor %}
+          </div>
+          <p class="xs muted" style="margin:8px 0 0">Analyse reads the report once; generate writes each rule, where quality matters most;
+            repair and translate are small follow-up calls that a cheaper model often handles well.</p>
+        </details>
+        <div class="form-actions">
+          <button class="btn">{{ ui.icon("check", "sm") }}{{ "Save" if b.active else "Use " ~ b.label }}</button>
+          {% if b.key_set %}<button class="btn outline" formaction="/ai/models/refresh" title="Lists models: uses no tokens or generation quota">{{ ui.icon("refresh", "sm") }}Refresh model list</button>
+          {% else %}<span class="xs muted">No key for {{ b.label }} yet: add one under <a href="#keys">API keys</a>.</span>{% endif %}
+        </div>
+      </form>
+      {% else %}
+      <p class="xs muted" style="margin:10px 0 0">{% if b.active %}Uses <code>{{ b.main }}</code>{% for st, m in b.stages.items() if m %}; {{ st }}: <code>{{ m }}</code>{% endfor %}. {% endif %}Only admins can change the model.</p>
+      {% endif %}
+      <details class="plain" style="margin-top:10px"><summary>{{ ui.icon("chevron-right", "sm chev") }}About these models</summary>
+        <div class="table-wrap" style="margin-top:10px;border:1px solid var(--border);border-radius:var(--radius)"><table class="table compact">
+          <thead><tr><th>Model</th><th>Price (input / output)</th>{% if b.provider == "anthropic" %}<th>Refusal fallback</th>{% endif %}<th>Notes</th></tr></thead>
+          <tbody>{% for m in b.models if m.note %}<tr><td><code>{{ m.id }}</code></td><td class="nowrap">{{ m.price }}</td>
+            {% if b.provider == "anthropic" %}<td>{{ "yes" if m.fallback else "no" }}</td>{% endif %}<td>{{ m.note }}</td></tr>{% endfor %}</tbody>
+        </table></div>
+        <p class="xs muted" style="margin:8px 0 0">List prices; cache reads and writes are priced separately. A fallback model answers when the chosen one declines a security report.</p>
+      </details>
+    </div>
+  {% endfor %}
+  </div>
+</section>
+
 <div class="grid grid-2" style="align-items:start">
   <section class="card">
     <div class="card-head"><h2>{{ ui.icon("cpu") }}Configuration</h2></div>
@@ -80,7 +132,7 @@
       <dl class="kv">
         <dt>Provider</dt><dd><strong>{{ ai.provider }}</strong> · AI {{ "enabled" if ai.enabled else "disabled (deterministic mode)" }}</dd>
         <dt>Credentials</dt><dd>{{ ui.status(ai.key, 'bad' if ai.key == 'not configured' else 'ok') }} <span class="xs muted">(the key itself is never shown)</span></dd>
-        <dt>Status</dt><dd>{{ ui.status(ai.state, 'ok' if ai.state == 'ok' else 'warn' if ai.state == 'refused' else 'bad') }}
+        <dt>Status</dt><dd>{{ ui.status(ai.state, 'ok' if ai.state == 'ok' else 'warn' if ai.state in ('refused', 'unavailable') else 'bad') }}
           {% if ai.retry_at %}<span class="xs muted"> resets at {{ ai.retry_at }} UTC{% if ai.wait %} (about {{ ai.wait }}){% endif %}</span>{% endif %}</dd>
         <dt>Requests today</dt><dd>{{ ai.requests_today }}{% if ai.limit %} of your cap {{ ai.limit }}{% else %} <span class="muted">(no cap set: <code>ai.daily_request_limit</code>)</span>{% endif %}</dd>
         <dt>Tokens today</dt><dd>{{ "{:,}".format(ai.in_today) }} input · {{ "{:,}".format(ai.out_today) }} output
@@ -110,6 +162,7 @@
       <tr><td class="shrink">{{ ui.status("daily cap", "bad") }}</td><td>Your own <code>ai.daily_request_limit</code> reached</td><td class="muted">Paused until local midnight</td></tr>
       <tr><td class="shrink">{{ ui.status("auth error", "bad") }}</td><td>Key missing, invalid or without permission</td><td class="muted">Paused until fixed and cleared</td></tr>
       <tr><td class="shrink">{{ ui.status("refused", "warn") }}</td><td>The model declined one request (safety filter)</td><td class="muted">Not a pause; that rule is skipped with a warning</td></tr>
+      <tr><td class="shrink">{{ ui.status("unavailable", "warn") }}</td><td>Provider down or overloaded (connection error, timeout, 5xx/529) after retries</td><td class="muted">Not a pause; uses <code>ai.failover_provider</code> if set and the report's TLP allows it, otherwise that step fails with a retry command</td></tr>
       </tbody>
     </table></div></div>
   </section>
@@ -136,8 +189,8 @@
       <ol class="steps">
         <li><div>Create a key at <code>aistudio.google.com</code> → <em>Get API key</em>, in a Google Cloud project with <strong>billing enabled</strong> (paid tier).</div></li>
         <li><div style="min-width:0;flex:1">Install the extra:<div style="margin-top:6px">{{ ui.code('pip install -e ".[gemini]"') }}</div></div></li>
-        <li><div style="min-width:0;flex:1">Paste the key under <a href="#keys">API keys</a> above, and select Gemini as the provider in <code>.env</code> (then restart):
-          <div style="margin-top:6px">{{ ui.code("TI2DAC_PROVIDER=gemini") }}</div></div></li>
+        <li><div style="min-width:0;flex:1">Paste the key under <a href="#keys">API keys</a> above, then click <em>Use Gemini</em> under <a href="#models">Model</a>.
+          On a server without the web UI, run <code>ti2dac model gemini-flash-latest --provider gemini</code>.</div></li>
         <li><div>Optional, recommended on low quotas: <code>ai.daily_request_limit</code> in <code>ti2dac.yaml</code> a little under your quota.</div></li>
       </ol>
       <div class="alert warn" style="margin-top:14px">{{ ui.icon("alert") }}<div class="xs">Free-tier keys: about 20 requests/day, prompts may be used by Google, and attack-simulation content can trip

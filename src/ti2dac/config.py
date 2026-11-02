@@ -1,12 +1,15 @@
 """Runtime configuration.
 
-Precedence: built-in defaults < ti2dac.yaml (or --config) < environment variables (TI2DAC_*).
+Precedence: built-in defaults < ti2dac.yaml (or --config) < the model choice saved from the web AI page or
+`ti2dac model` (<state_dir>/ai_models.json) < environment variables (TI2DAC_*).
 Secrets (ANTHROPIC_API_KEY, web credentials) are only ever read from the environment.
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field, fields, is_dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +37,13 @@ class AIConfig:
     translate: StageConfig = field(default_factory=lambda: StageConfig(effort="low", max_tokens=4000))
     # Server-side refusal fallback (security content can trip the cyber classifier).
     server_side_fallback: bool = True
+    # Provider to use when the primary is down (connection error, timeout, 5xx/529 after retries); "" = off.
+    # Only used when the report's TLP is in allowed_tlp for that provider. failover_model "" = provider default.
+    failover_provider: str = ""
+    failover_model: str = ""
+    # USD per 1M tokens [input, output, cache_read] by model id, added to / overriding llm.PRICES
+    # (e.g. a paid Gemini tier). Models without a price are reported as unpriced, not as $0.
+    prices: dict[str, list[float]] = field(default_factory=dict)
     max_repair_attempts: int = 2
     # Report text sent to the analysis call is condensed to roughly this many tokens.
     input_token_budget: int = 6000
@@ -75,6 +85,23 @@ class FetchConfig:
 
 
 @dataclass
+class LogConfig:
+    """Operational logs (JSON lines, metadata only) for files, stderr and syslog; see obs.py."""
+    level: str = "INFO"
+    dir: str = ""                 # "" = <state_dir>/logs
+    max_mb: int = 10              # rotate at this size; 0 = no log file
+    backups: int = 5              # rotated files kept (oldest deleted)
+    json_stderr: bool = False     # JSON lines on stderr too (containers, journald)
+    syslog: str = ""              # forward events: "udp://siem.example:514", "tcp://host:514" or "/dev/log"
+
+
+@dataclass
+class HealthConfig:
+    min_free_mb: int = 1024       # /healthz warns below this free space in state/output dirs; fails below a quarter
+    stuck_job_minutes: int = 60   # a web job running longer than this is reported as stuck
+
+
+@dataclass
 class Settings:
     author: str = "SHL Detection Engineering (ti2dac)"
     output_dir: str = "output"
@@ -101,6 +128,8 @@ class Settings:
     ai: AIConfig = field(default_factory=AIConfig)
     fetch: FetchConfig = field(default_factory=FetchConfig)
     redaction: RedactionConfig = field(default_factory=RedactionConfig)
+    log: LogConfig = field(default_factory=LogConfig)
+    health: HealthConfig = field(default_factory=HealthConfig)
 
     @property
     def cache_dir(self) -> Path:
@@ -202,18 +231,70 @@ def load_settings(path: str | Path | None = None) -> Settings:
         s.output_dir = env["TI2DAC_OUTPUT_DIR"]
     if "TI2DAC_STATE_DIR" in env:
         s.state_dir = env["TI2DAC_STATE_DIR"]
+    apply_model_choice(s, read_model_choice(s.state_dir))
+    apply_ai_env(s)
+    return s
+
+
+# --------------------------------------------------------------------------- model choice (web AI page / `ti2dac model`)
+PROVIDERS = ("anthropic", "gemini")
+STAGES = ("analyze", "generate", "repair", "translate")
+ENV_MODEL_VARS = ("TI2DAC_PROVIDER", "TI2DAC_MODEL")
+
+
+def model_choice_path(state_dir: str | Path) -> Path:
+    return Path(state_dir) / "ai_models.json"
+
+
+def read_model_choice(state_dir: str | Path) -> dict:
+    """{"provider": ..., "models": {provider: {stage: model}}, "updated_by", "updated_at"}; {} if never set."""
+    try:
+        data = json.loads(model_choice_path(state_dir).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_model_choice(state_dir: str | Path, provider: str, models: dict[str, str], actor: str) -> dict:
+    data = read_model_choice(state_dir)
+    data["provider"] = provider
+    data.setdefault("models", {})[provider] = {k: models[k] for k in STAGES}
+    data.update(updated_by=actor, updated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    p = model_choice_path(state_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=1))
+    tmp.replace(p)
+    return data
+
+
+def apply_model_choice(s: Settings, choice: dict) -> None:
+    """The saved choice overrides ti2dac.yaml (environment variables still override both)."""
+    if choice.get("provider") in PROVIDERS:
+        s.ai.provider = choice["provider"]
+    models = (choice.get("models") or {}).get(s.ai.provider) or {}
+    for stage in STAGES:
+        if isinstance(models.get(stage), str) and models[stage]:
+            getattr(s.ai, stage).model = models[stage]
+
+
+def apply_ai_env(s: Settings) -> None:
+    """AI environment overrides and provider/model consistency. Idempotent, so it can be re-applied after a change."""
+    env = os.environ
     if env.get("TI2DAC_NO_AI", "").lower() in ("1", "true", "yes"):
         s.ai.enabled = False
     if "TI2DAC_PROVIDER" in env:
         s.ai.provider = env["TI2DAC_PROVIDER"].lower()
-    if s.ai.provider not in ("anthropic", "gemini"):
+    if s.ai.provider not in PROVIDERS:
         raise ValueError(f"ai.provider must be 'anthropic' or 'gemini', not {s.ai.provider!r}")
-    stages = (s.ai.analyze, s.ai.generate, s.ai.repair, s.ai.translate)
-    if s.ai.provider == "gemini":
-        for st in stages:
-            if st.model.startswith("claude"):
-                st.model = s.ai.gemini_model
+    if s.ai.failover_provider not in ("", *PROVIDERS):
+        raise ValueError(f"ai.failover_provider must be '', 'anthropic' or 'gemini', not {s.ai.failover_provider!r}")
+    for stage in STAGES:   # a stage still naming the other provider's model gets this provider's default
+        st = getattr(s.ai, stage)
+        if s.ai.provider == "gemini" and st.model.startswith("claude"):
+            st.model = s.ai.gemini_model
+        elif s.ai.provider == "anthropic" and not st.model.startswith("claude"):
+            st.model = StageConfig().model
     if "TI2DAC_MODEL" in env:   # one switch to move every stage to another model
-        for st in stages:
-            st.model = env["TI2DAC_MODEL"]
-    return s
+        for stage in STAGES:
+            getattr(s.ai, stage).model = env["TI2DAC_MODEL"]

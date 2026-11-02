@@ -10,12 +10,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from . import __version__, attack, duplicates, quality, redact, replay, safety
+from . import __version__, attack, duplicates, obs, quality, redact, replay, safety
 from . import sigma_tools as st
 from .condense import condense, procedure_signals
 from .config import Settings
@@ -372,6 +373,7 @@ def likely_categories(b) -> list[str]:
 
 def generate(record: RunRecord, settings: Settings, llm: LLM, store: Store | None = None,
              progress: Progress = _noop, behaviour_ids: list[str] | None = None, actor: str = "") -> list[DetectionPackage]:
+    obs.run_id.set(record.run_id)
     todo = [b for b in record.behaviours if (b.id in behaviour_ids if behaviour_ids else b.selected)]
     existing = {p.behaviour.id for p in record.packages}
     todo = [b for b in todo if b.id not in existing]
@@ -404,30 +406,51 @@ def generate(record: RunRecord, settings: Settings, llm: LLM, store: Store | Non
             # One failed behaviour must not discard the others; it can be retried with `ti2dac generate`.
             record.warnings.append(f"{b.id} ({b.technique_id}) not generated: {e}. Retry: ti2dac generate {record.run_id} --select {b.id}")
             progress(f"{slug}: FAILED ({e})")
+            obs.event("rule.failed", logging.WARNING, behaviour=b.id, technique=b.technique_id, error=str(e)[:500])
             return None
 
     parallel = settings.ai.max_parallel or (1 if settings.ai.provider == "gemini" else 4)
     with ThreadPoolExecutor(max_workers=min(parallel, max(1, len(todo)))) as ex:
-        pkgs = [p for p in ex.map(one, enumerate(todo, 1)) if p is not None]
+        pkgs = [p for p in ex.map(obs.in_context(one), enumerate(todo, 1)) if p is not None]
     for i, p in enumerate(pkgs, start + 1):   # keep slugs contiguous when a behaviour failed
         if p.slug != f"rule-{i:03d}":
             p.slug = f"rule-{i:03d}"
     record.packages.extend(pkgs)
     record.usage = llm.usage
-    record.usage.estimated_cost_usd = estimate_cost(record.usage)
+    record.usage.estimated_cost_usd = estimate_cost(record.usage, settings.ai.prices)
     return pkgs
 
 
-def run(source: str, settings: Settings, *, count: int | None = None, explicit: list[str] | None = None,
-        raw: bytes | None = None, filename: str | None = None, store: Store | None = None,
-        progress: Progress = _noop, actor: str = "", incident: bool | None = None, tlp_override: str = "",
-        evidence_events: list[dict] | None = None) -> tuple[RunRecord, LoadedReport]:
+def run(source: str, settings: Settings, **kw) -> tuple[RunRecord, LoadedReport]:
+    """Full pipeline (see _run), reported as run.finish / run.failed events."""
+    t0 = time.monotonic()
+    obs.run_id.set("")
+    try:
+        record, loaded = _run(source, settings, **kw)
+    except Exception as e:
+        obs.event("run.failed", logging.WARNING, error_type=type(e).__name__, error=str(e)[:500],
+                  duration_s=round(time.monotonic() - t0, 1))
+        raise
+    u = record.usage
+    obs.event("run.finish", kind=record.report.kind, tlp=record.report.tlp_effective, ai=record.ai_enabled,
+              behaviours=len(record.behaviours), rules=len(record.packages),
+              rules_failed=sum(1 for w in record.warnings if " not generated: " in w), warnings=len(record.warnings),
+              ai_calls=u.calls, ai_cached_calls=u.cached_calls, input_tokens=u.input_tokens, output_tokens=u.output_tokens,
+              cost_usd=u.estimated_cost_usd, duration_s=round(time.monotonic() - t0, 1))
+    return record, loaded
+
+
+def _run(source: str, settings: Settings, *, count: int | None = None, explicit: list[str] | None = None,
+         raw: bytes | None = None, filename: str | None = None, store: Store | None = None,
+         progress: Progress = _noop, actor: str = "", incident: bool | None = None, tlp_override: str = "",
+         evidence_events: list[dict] | None = None) -> tuple[RunRecord, LoadedReport]:
     attack.set_override_dir(settings.state_dir)
     loaded = load_report(source, settings.fetch, raw=raw, filename=filename)
     progress(f"ingested {loaded.meta.title!r} ({loaded.meta.content_type}, {loaded.meta.chars} chars, sha256 {loaded.meta.sha256[:12]})")
     prepare_report(loaded, settings, incident=incident, tlp_override=tlp_override, progress=progress)
-    llm = LLM(settings) if settings.ai.enabled else None
+    llm = LLM(settings, tlp=loaded.meta.tlp_effective) if settings.ai.enabled else None
     record, _ = analyze(loaded, settings, llm, progress)
+    obs.run_id.set(record.run_id)
     record.created_by = actor
     select(record.behaviours, count or settings.select_count, explicit)
     if record.behaviours and not any(b.selected for b in record.behaviours):

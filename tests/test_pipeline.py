@@ -16,7 +16,7 @@ from .conftest import FakeLLM
 
 def _run(settings, report_file, monkeypatch, **kw):
     fake = FakeLLM(settings, **kw)
-    monkeypatch.setattr(pipeline, "LLM", lambda s, *a: fake)
+    monkeypatch.setattr(pipeline, "LLM", lambda s, *a, **k: fake)
     store = Store(settings.db_path)
     record, loaded = pipeline.run(str(report_file), settings, store=store, actor="alice")
     out = Path(settings.output_dir) / record.run_id

@@ -3,20 +3,19 @@ from __future__ import annotations
 
 import getpass
 import json
-import logging
 import sys
 from pathlib import Path
 from typing import Optional
 
 import typer
 
-from . import attack
+from . import attack, obs
 from . import sigma_tools as st
 from .config import Settings, load_settings
 from .feedback import ARTIFACTS, CATEGORIES, REVIEW_STATES, SEVERITIES, TEST_RESULTS, Store
 from .ingest import IngestError, load_report
 from .llm import LLM, LLMError, estimate_cost
-from .render import load_record, render, rule_filename
+from .render import load_record, render, rule_filename, usage_summary
 from .targets import LLM_TARGET_LABELS, TARGETS
 
 app = typer.Typer(add_completion=False, no_args_is_help=True,
@@ -30,10 +29,13 @@ _state: dict = {}
 
 
 @app.callback()
-def _main(config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to ti2dac.yaml"),
+def _main(ctx: typer.Context, config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to ti2dac.yaml"),
           verbose: bool = typer.Option(False, "--verbose", "-v")):
-    logging.basicConfig(level=logging.DEBUG if verbose else logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
     _state["settings"] = load_settings(config)
+    # The web server and CLI commands log to separate files (see obs.setup); terminal output is unchanged.
+    obs.setup(_state["settings"], component="web" if ctx.invoked_subcommand == "serve" else "cli", verbose=verbose)
+    if ctx.invoked_subcommand not in (None, "serve"):
+        obs.event("cli.command", command=ctx.invoked_subcommand, user=getpass.getuser())
 
 
 def S() -> Settings:
@@ -68,7 +70,7 @@ def _actor() -> str:
 
 
 def _llm(record) -> LLM | None:
-    return LLM(S(), record.usage) if S().ai.enabled else None
+    return LLM(S(), record.usage, tlp=record.report.tlp_effective) if S().ai.enabled else None
 
 
 def _rerender(record, path: Path) -> None:
@@ -88,9 +90,8 @@ def _print_behaviours(record) -> None:
 def _print_usage(record) -> None:
     u = record.usage
     if u.calls or u.cached_calls:
-        u.estimated_cost_usd = estimate_cost(u)
-        typer.echo(f"\nAI usage: {u.calls} calls (+{u.cached_calls} cached), in {u.input_tokens:,} / out {u.output_tokens:,} tokens, "
-                   f"cache-read {u.cache_read_tokens:,}; est. ${u.estimated_cost_usd}", err=True)
+        u.estimated_cost_usd = estimate_cost(u, S().ai.prices)
+        typer.echo(f"\nAI usage: {usage_summary(u)}", err=True)
 
 
 # --------------------------------------------------------------------------- main flows
@@ -163,7 +164,7 @@ def analyze(source: str, no_ai: bool = typer.Option(False, "--no-ai"),
     try:
         loaded = load_report(source, s.fetch)
         prepare_report(loaded, s, incident=incident, tlp_override=tlp_override, progress=_progress)  # redaction + TLP
-        record, _ = analyze_report(loaded, s, LLM(s) if s.ai.enabled else None, _progress)
+        record, _ = analyze_report(loaded, s, LLM(s, tlp=loaded.meta.tlp_effective) if s.ai.enabled else None, _progress)
     except (IngestError, LLMError, ValueError) as e:
         _fail(str(e))
     record.created_by = getpass.getuser()
@@ -206,7 +207,7 @@ def generate(run_id: str, select: str = typer.Option(..., "--select", "-s", help
         _fail(f"unknown behaviour id(s): {', '.join(sorted(unknown))}")
     for b in record.behaviours:
         b.selected = b.selected or b.id in ids
-    llm = LLM(s, record.usage)
+    llm = LLM(s, record.usage, tlp=record.report.tlp_effective)
     try:
         gen(record, s, llm, _store(), _progress, behaviour_ids=ids, actor=getpass.getuser())
     except LLMError as e:
@@ -401,7 +402,7 @@ def feedback_apply(fid: int, ai: bool = typer.Option(False, "--ai", help="Let th
             new = apply_correction(record, fb["slug"], S(), corrected_yaml=correction, llm=_llm(record), progress=_progress,
                                    actor=reviewer)
         elif ai:
-            llm = LLM(S(), record.usage)
+            llm = LLM(S(), record.usage, tlp=record.report.tlp_effective)
             text = f"[{fb['category']}] {fb['comment']}" + (f" (SIEM: {fb['target']})" if fb["target"] else "")
             new = apply_correction(record, fb["slug"], S(), feedback_text=text, llm=llm, progress=_progress, actor=reviewer)
         else:
@@ -503,6 +504,70 @@ def review(run_id: str, slug: str, status: str = typer.Option(..., help="|".join
     _store().set_review(run_id, slug, status, reviewer, note)
     _rerender(record, path)
     typer.echo(f"{slug}: review={status}, sigma status={sigma_status} ({path}/rules/{rule_filename(pkg)})")
+
+
+@app.command("model")
+def model_cmd(model: str = typer.Argument("", help="Model id to use, e.g. claude-sonnet-5-5. Omit to list the choices"),
+              provider: str = typer.Option("", "--provider", "-p", help="anthropic or gemini (default: the active provider)"),
+              stage: list[str] = typer.Option([], "--stage", help="Only these stages (analyze, generate, repair, translate); "
+                                                                  "repeat the option for several. Default: every stage"),
+              refresh: bool = typer.Option(False, "--refresh", help="Fetch the models your key can use first (no tokens)")):
+    """Show or choose the AI model. Same setting as the web AI page; TI2DAC_PROVIDER / TI2DAC_MODEL still win."""
+    from . import modelchoice
+    from .config import STAGES
+
+    s = S()
+    prov = provider or s.ai.provider
+    if prov not in modelchoice.PROVIDER_LABELS:
+        _fail(f"unknown provider {prov!r} (anthropic or gemini)")
+    if refresh:
+        ok, msg = modelchoice.refresh(s, prov)
+        (typer.echo if ok else lambda m: typer.secho(m, fg=typer.colors.YELLOW, err=True))(msg)
+    if not model:
+        cur = modelchoice.current(s, prov)
+        typer.echo(f"{modelchoice.PROVIDER_LABELS[prov]}{'  (active provider)' if prov == s.ai.provider else ''}")
+        typer.echo("in use: " + ", ".join(f"{k}={v}" for k, v in cur.items()))
+        for m in modelchoice.available(s, prov):
+            mark = "*" if m["id"] in cur.values() else " "
+            typer.echo(f" {mark} {m['id']:28} {m['price']:28} {m['note']}")
+        if modelchoice.env_locks():
+            typer.secho(f"note: {', '.join(modelchoice.env_locks())} set in the environment override the saved choice",
+                        fg=typer.colors.YELLOW, err=True)
+        return
+    bad = [x for x in stage if x not in STAGES]
+    if bad:
+        _fail(f"unknown stage(s): {', '.join(bad)} (use {', '.join(STAGES)})")
+    models = modelchoice.current(s, prov)
+    models.update({k: model for k in (stage or STAGES)})
+    try:
+        new = modelchoice.choose(s, prov, models, _actor())
+    except ValueError as e:
+        _fail(str(e))
+    _store().audit(_actor(), "ai.models.set", {"provider": prov, "models": models})
+    _state["settings"] = new
+    typer.echo(f"{modelchoice.PROVIDER_LABELS[prov]} is the active provider: "
+               + ", ".join(f"{k}={getattr(new.ai, k).model}" for k in STAGES))
+    if modelchoice.env_locks():
+        typer.secho(f"note: {', '.join(modelchoice.env_locks())} set in the environment still override this",
+                    fg=typer.colors.YELLOW, err=True)
+
+
+@app.command("health")
+def health_cmd(as_json: bool = typer.Option(False, "--json", help="Machine-readable output")):
+    """Database, disk space, AI provider and stuck jobs (same checks as /healthz). Exit code 1 when a check fails."""
+    from . import health
+
+    result = health.check(S(), _store())
+    if as_json:
+        typer.echo(json.dumps(result, indent=1))
+    else:
+        for name, c in result["checks"].items():
+            detail = c.get("message") or ", ".join(f"{k}={v}" for k, v in c.items() if k != "status")
+            typer.secho(f"{c['status']:5} {name:12} {detail}",
+                        fg={"ok": typer.colors.GREEN, "warn": typer.colors.YELLOW}.get(c["status"], typer.colors.RED))
+        typer.echo(f"overall: {result['status']}")
+    if result["status"] == "fail":
+        raise typer.Exit(1)
 
 
 @app.command("ai-status")

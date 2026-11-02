@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 import secrets
 import shutil
 import threading
+import time
 import traceback
 import uuid
 from datetime import datetime
@@ -26,13 +28,15 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.templating import Jinja2Templates
 from markdown_it import MarkdownIt
 from markupsafe import Markup
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from .. import __version__, aistatus, attack
-from ..config import Settings, env_file, env_source, set_env_secret
+from .. import __version__, aistatus, attack, health, modelchoice, obs
+from ..config import STAGES, Settings, env_file, env_source, set_env_secret
 from ..feedback import ARTIFACTS, CATEGORIES, REVIEW_STATES, SEVERITIES, TEST_RESULTS, Store, target_status
 from ..llm import LLM, LLMError, verify_key
 from ..render import load_record, render, rule_filename
@@ -59,9 +63,16 @@ _LOOPBACK = ("127.0.0.1", "localhost", "::1", "testserver")
 
 
 class _Security(BaseHTTPMiddleware):
-    def __init__(self, app, users: Users, user: str | None, password: str | None):
+    def __init__(self, app, users: Users, user: str | None, password: str | None, store: Store):
         super().__init__(app)
-        self.users, self.user, self.password = users, user, password
+        self.users, self.user, self.password, self.store = users, user, password, store
+
+    @staticmethod
+    def _claimed_user(request: Request) -> str:
+        try:
+            return base64.b64decode(request.headers["authorization"][6:]).decode().partition(":")[0][:64]
+        except Exception:
+            return "(unreadable)"
 
     def _authenticate(self, request: Request) -> tuple[str, str] | None:
         auth = request.headers.get("authorization", "")
@@ -79,9 +90,28 @@ class _Security(BaseHTTPMiddleware):
         return None
 
     async def dispatch(self, request: Request, call_next):
+        rid = request.headers.get("x-request-id", "")
+        obs.request_id.set(rid if re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", rid) else uuid.uuid4().hex[:16])
+        t0, path = time.monotonic(), request.url.path
+        client = request.client.host if request.client else ""
+        request.state.user, request.state.role = "", ""
+        resp = await self._dispatch(request, call_next, client)
+        resp.headers["X-Request-ID"] = obs.request_id.get()
+        if not path.startswith("/static/") and path != "/healthz":
+            obs.event("http.request", logging.WARNING if resp.status_code >= 500 else logging.INFO,
+                      method=request.method, path=path, status=resp.status_code, user=request.state.user,
+                      client=client, duration_ms=round((time.monotonic() - t0) * 1000))
+        return resp
+
+    async def _dispatch(self, request: Request, call_next, client: str):
+        if request.url.path == "/healthz":   # for uptime checkers: no login, no details that need one
+            return await call_next(request)
         if self.users.any() or (self.user and self.password):
             who = self._authenticate(request)
             if who is None:
+                if request.headers.get("authorization"):   # a wrong login, not a browser's first unauthenticated request
+                    self.store.audit(self._claimed_user(request), "auth.failed",
+                                     {"client": client, "path": request.url.path}, logging.WARNING)
                 return PlainTextResponse("authentication required", 401, {"WWW-Authenticate": 'Basic realm="ti2dac"'})
             request.state.user, request.state.role = who
         else:   # local single-user mode (loopback only, enforced by `ti2dac serve`)
@@ -89,6 +119,8 @@ class _Security(BaseHTTPMiddleware):
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             origin = request.headers.get("origin") or request.headers.get("referer")
             if origin and urlparse(origin).netloc != request.headers.get("host"):
+                self.store.audit(request.state.user, "csrf.refused", {"client": client, "path": request.url.path,
+                                                                      "origin": urlparse(origin).netloc[:200]}, logging.WARNING)
                 return PlainTextResponse("cross-origin request refused", 403)
         resp = await call_next(request)
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -102,12 +134,21 @@ def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(title="ti2dac", version=__version__, docs_url=None, redoc_url=None,
                   description="Threat intel → Sigma → multi-SIEM detection packages. HTTP Basic auth when users are configured.")
     app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
-    app.add_middleware(_Security, users=Users(settings.state_dir), user=os.environ.get("TI2DAC_WEB_USER"),
-                       password=os.environ.get("TI2DAC_WEB_PASSWORD"))
-    attack.set_override_dir(settings.state_dir)
     store = Store(settings.db_path)
+    app.add_middleware(_Security, users=Users(settings.state_dir), user=os.environ.get("TI2DAC_WEB_USER"),
+                       password=os.environ.get("TI2DAC_WEB_PASSWORD"), store=store)
+    attack.set_override_dir(settings.state_dir)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, exc: StarletteHTTPException):
+        if exc.status_code == 403:   # a signed-in user tried something their role does not allow
+            store.audit(getattr(request.state, "user", ""), "access.denied",
+                        {"path": request.url.path, "method": request.method, "reason": str(exc.detail)[:200],
+                         "role": getattr(request.state, "role", "")}, logging.WARNING)
+        return await http_exception_handler(request, exc)
     store.interrupt_running_jobs()   # jobs from a previous process cannot still be running
     key_checks: dict[str, dict] = {}   # provider -> last key check shown on the AI page (never the key)
+    model_msgs: dict[str, dict] = {}   # provider -> last model save / list refresh result
 
     def run_dir(run_id: str) -> Path:
         p = store.run_path(run_id)
@@ -155,13 +196,22 @@ def create_app(settings: Settings) -> FastAPI:
             store.job_log(jid, msg)
 
         def target():
+            obs.job_id.set(jid)
+            t0, status, run_id, error = time.monotonic(), "done", None, None
+            obs.event("job.start", label=label[:200], actor=actor)
             try:
-                store.job_finish(jid, "done", run_id=fn(progress))
+                run_id = fn(progress)
+                store.job_finish(jid, "done", run_id=run_id)
             except (LLMError, ValueError) as e:
-                store.job_finish(jid, "failed", error=str(e))
+                status, error = "failed", str(e)
+                store.job_finish(jid, "failed", error=error)
             except Exception as e:  # surface unexpected failures to the operator
+                status, error = "failed", f"{type(e).__name__}: {e}"
                 store.job_log(jid, traceback.format_exc(limit=3))
-                store.job_finish(jid, "failed", error=f"{type(e).__name__}: {e}")
+                store.job_finish(jid, "failed", error=error)
+                obs.log.exception("job %s crashed", jid)
+            obs.event("job.finish", logging.WARNING if status == "failed" else logging.INFO, status=status,
+                      run_id=run_id or "", error=(error or "")[:500], duration_s=round(time.monotonic() - t0, 1))
 
         threading.Thread(target=target, daemon=True).start()
         return jid
@@ -267,7 +317,7 @@ def create_app(settings: Settings) -> FastAPI:
 
             record = load_record(path)
             check_tlp_for_run(record, settings)
-            generate(record, settings, LLM(settings, record.usage), store, progress, behaviour_ids=ids,
+            generate(record, settings, LLM(settings, record.usage, tlp=record.report.tlp_effective), store, progress, behaviour_ids=ids,
                      actor=request.state.user)
             rerender(record, path)
             return run_id
@@ -295,7 +345,7 @@ def create_app(settings: Settings) -> FastAPI:
         if correction.strip() and artifact == "sigma_rule":
             try:
                 new = apply_correction(record, slug, settings, corrected_yaml=correction,
-                                       llm=LLM(settings, record.usage) if settings.ai.enabled else None,
+                                       llm=LLM(settings, record.usage, tlp=record.report.tlp_effective) if settings.ai.enabled else None,
                                        actor=request.state.user)
                 store.resolve_feedback(fid, "applied", f"{slug} -> v{new.version}", request.state.user)
                 store.add_lesson(store.get_feedback(fid), new.behaviour.technique_id, new.draft.sigma.logsource.product,
@@ -325,7 +375,7 @@ def create_app(settings: Settings) -> FastAPI:
         def work(progress):
             record = load_record(path)
             text = f"[{fb['category']}] {fb['comment']}" + (f" (SIEM: {fb['target']})" if fb["target"] else "")
-            new = apply_correction(record, fb["slug"], settings, feedback_text=text, llm=LLM(settings, record.usage),
+            new = apply_correction(record, fb["slug"], settings, feedback_text=text, llm=LLM(settings, record.usage, tlp=record.report.tlp_effective),
                                    progress=progress, actor=user)
             store.resolve_feedback(fid, "applied", f"{fb['slug']} -> v{new.version} (AI)", user)
             store.add_lesson(fb, new.behaviour.technique_id, new.draft.sigma.logsource.product,
@@ -430,8 +480,53 @@ def create_app(settings: Settings) -> FastAPI:
                          "tail": f"…{val[-4:]}" if len(val) >= 12 else "", "active": prov == settings.ai.provider,
                          "check": key_checks.get(prov)})
         insecure = request.url.scheme == "http" and (request.url.hostname or "") not in _LOOPBACK
+        choice = modelchoice.read_model_choice(settings.state_dir)
+        blocks = []
+        for prov, label in modelchoice.PROVIDER_LABELS.items():
+            cur = modelchoice.current(settings, prov)
+            main = cur["generate"]
+            blocks.append({"provider": prov, "label": label, "active": prov == settings.ai.provider,
+                           "models": modelchoice.available(settings, prov), "main": main,
+                           "stages": {k: ("" if v == main else v) for k, v in cur.items()},
+                           "effort": {k: getattr(settings.ai, k).effort for k in STAGES},
+                           "fetched_at": modelchoice.fetched_at(settings, prov), "key_set": bool(os.environ.get(KEY_VARS[prov][0])),
+                           "msg": model_msgs.get(prov)})
         return TEMPLATES.TemplateResponse(request, "ai.html", ctx(
-            request, just_blocked=bool(blocked), keys=keys, env_path=str(env_file().resolve()), insecure=insecure))
+            request, just_blocked=bool(blocked), keys=keys, env_path=str(env_file().resolve()), insecure=insecure,
+            model_blocks=blocks, model_locks=modelchoice.env_locks(), model_choice=choice, stages=STAGES))
+
+    @app.post("/ai/models")
+    async def ai_models(request: Request):
+        """Choose the provider and the model for every stage (admins only). Applies to jobs started from now on."""
+        nonlocal settings
+        if request.state.role != "admin":
+            raise HTTPException(403, "only admins can change the AI model")
+        form = await request.form()
+        provider, main = str(form.get("provider", "")), str(form.get("model", ""))
+        models = {k: str(form.get(f"stage_{k}") or main) for k in STAGES}
+        try:
+            settings = modelchoice.choose(settings, provider, models, request.state.user)
+        except ValueError as e:
+            model_msgs[provider] = {"ok": False, "message": str(e), "by": request.state.user, "at": datetime.now().strftime("%H:%M:%S")}
+            return RedirectResponse("/ai#models", 303)
+        store.audit(request.state.user, "ai.models.set", {"provider": provider, "models": models})
+        msg = f"Saved: {modelchoice.PROVIDER_LABELS[provider]} is the active provider. New jobs use it; running jobs finish as they started."
+        if modelchoice.env_locks():
+            msg += f" Note: {', '.join(modelchoice.env_locks())} in the server environment still override this choice."
+        model_msgs.clear()
+        model_msgs[provider] = {"ok": True, "message": msg, "by": request.state.user, "at": datetime.now().strftime("%H:%M:%S")}
+        return RedirectResponse("/ai#models", 303)
+
+    @app.post("/ai/models/refresh")
+    def ai_models_refresh(request: Request, provider: str = Form(...)):
+        """Fetch the models the provider's key can use (no tokens). Admins only."""
+        if request.state.role != "admin":
+            raise HTTPException(403, "only admins can refresh the model list")
+        if provider not in KEY_VARS:
+            raise HTTPException(400, "unknown provider")
+        ok, msg = modelchoice.refresh(settings, provider)
+        model_msgs[provider] = {"ok": ok, "message": msg, "by": request.state.user, "at": datetime.now().strftime("%H:%M:%S")}
+        return RedirectResponse("/ai#models", 303)
 
     @app.post("/ai/key")
     def ai_key(request: Request, provider: str = Form(...), action: str = Form(...), key: str = Form("")):
@@ -449,6 +544,9 @@ def create_app(settings: Settings) -> FastAPI:
             store.audit(user, "ai.key.set", {"provider": provider, "key_tail": key[-4:]})
             ok, msg = verify_key(provider, key)
             msg = ("Saved. " if ok else "Saved, but the check failed: ") + msg
+            if ok:   # the model picker can now offer what this key can use
+                listed, _ = modelchoice.refresh(settings, provider)
+                msg += " Choose its model under Model below." if listed else ""
         elif action == "test":
             if not os.environ.get(var):
                 raise HTTPException(400, f"no {var} to test")
@@ -475,6 +573,12 @@ def create_app(settings: Settings) -> FastAPI:
         aistatus.reset(settings.state_dir, settings.ai.provider)
         store.audit(request.state.user, "ai.reset", {"provider": settings.ai.provider})
         return RedirectResponse("/ai", 303)
+
+    @app.get("/healthz")
+    def healthz():
+        """Database, disk space, AI provider and stuck jobs. No login needed; 503 when a check fails."""
+        result = health.check(settings, store)
+        return JSONResponse(result, status_code=503 if result["status"] == "fail" else 200)
 
     @app.get("/api/ai-status")
     def api_ai_status():

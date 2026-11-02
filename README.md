@@ -58,6 +58,8 @@ The tool needs **one** API key, for Claude (default) or Gemini. Keys are read fr
    ```
    Alternatively, `export` it in your shell or run `ant auth login`.
 4. Check it with `ti2dac ai-status`, or open the **AI settings** page in the web UI.
+5. Pick the model under **Model** on that page (Opus 5.5 by default; Sonnet 5.5, Haiku 5.5, Fable 5.1 or Opus 5,
+   for every stage or per stage), or run `ti2dac model claude-sonnet-5-5`.
 
 A Claude.ai or Claude Code subscription is not an API key. API usage is billed separately in the Console.
 
@@ -86,6 +88,8 @@ The tool stops instead of hammering the provider:
 | Your own `ai.daily_request_limit` reached | Pauses until local midnight, before the provider's limit is ever hit |
 | Key missing, invalid or without permission | Pauses until the key is fixed and the pause is cleared |
 | Model declines one request | That rule is skipped with a warning; not a pause |
+| Provider down or overloaded (connection error, timeout, 5xx/529) | The SDK retries (Gemini: 2 retries); then `ai.failover_provider` answers if set and the report's TLP is allowed there, otherwise that step fails with a retry command. Not a pause |
+| Response does not match the schema | One corrective re-ask that tells the model what failed; a second failure is reported |
 
 - **The pause is shared.** It lives in `.ti2dac/ai_status.json`, so every CLI run and the web UI respect it, and no request is sent while it is active. Cache hits still work.
 - **Finished work is kept.** Rules finished before the limit are kept, and each skipped behaviour gets a ready-to-paste retry command.
@@ -142,7 +146,11 @@ The runs table lists every package with its date, AI calls, **tokens in/out**, e
 **③ Feedback & lessons page:** all feedback with its status, the *lessons* the AI receives on future runs (each can be disabled), the audit log, and a JSONL export.
 
 **④ AI settings page:** provider, models, whether a key is configured, status and reset time, requests and
-**tokens today and in total** with estimated cost, the last error, and setup steps. Admins can clear a pause here.
+**tokens today and in total** with estimated cost, the last error, and setup steps. Admins can clear a pause here,
+and choose the **provider and model** (one for every stage, or a different one per stage), with each model's price
+and whether it has refusal fallback. *Refresh model list* asks the provider which models your key can use (no tokens).
+The choice is saved in `.ti2dac/ai_models.json`, overrides `ti2dac.yaml`, and applies to jobs started after saving;
+`TI2DAC_PROVIDER` / `TI2DAC_MODEL` in the server environment still win, and the page says so when they are set.
 
 **⑤ Downloads:** the zip on the Runs page is the shareable package. It never includes the original report, the redaction map or raw logs.
 
@@ -158,6 +166,7 @@ ti2dac feedback add <run-id> rule-001 --artifact sigma_rule --category too_broad
 ti2dac review <run-id> rule-001 --status approved  # as a different user than the author
 ti2dac export <run-id> --repo ../detections        # approved rules into your Git detection repo
 ti2dac ai-status                                   # key, limits, requests and tokens today
+ti2dac model                                       # list models with prices; `ti2dac model <id> [--stage generate]` to choose
 ```
 
 Each `run` prints its AI calls and tokens at the end. The package folder is `output/<run-id>/`; start with `report-summary.md`.
@@ -211,7 +220,9 @@ A typical report costs **1 + N calls** (N = rules, default 3). Each run reports 
 | Content-addressed response cache (prompt version + model + input) | Re-runs and later `--select` choices cost 0 tokens |
 
 **Providers.** Claude (`claude-opus-5-5`) is the default, with server-side refusal fallback enabled because security
-content can trip safety classifiers. Gemini is optional, for testing with an AI Studio key:
+content can trip safety classifiers. When a fallback model answers, its tokens are priced at that model's rates
+(and a refusal before any output is counted as free unless its category is billed). Models without a known price
+are shown as *not priced* rather than $0. Gemini is optional, for testing with an AI Studio key:
 
 ```bash
 uv pip install --python .venv/bin/python -e ".[gemini]"
@@ -296,9 +307,44 @@ Copy `ti2dac.example.yaml` to `ti2dac.yaml`, which is git-ignored. The settings 
 | `index_overrides: {splunk: "index=wineventlog", elastic_esql: "logs-endpoint.events.*"}` | Scope queries to your indexes and tables |
 | `rule_repos: [../detections/rules]` | Internal rules to check for duplicates (plus `ti2dac sigmahq-sync`) |
 | `targets`, `ai_fill_gaps`, `llm_targets` | Which SIEMs to produce queries for, and where AI may fill gaps |
-| `ai.provider`, `ai.<stage>.model / effort / max_tokens` | Provider, models and the token/quality trade-off |
+| `ai.provider`, `ai.<stage>.model / effort / max_tokens` | Provider, models and the token/quality trade-off (the web AI page / `ti2dac model` choice overrides these models) |
+| `ai.failover_provider`, `ai.failover_model` | Second provider for outages only (off by default; TLP policy still applies) |
+| `ai.prices: {model-id: [input, output, cache_read]}` | USD per 1M tokens for models ti2dac has no price for (e.g. a paid Gemini tier) |
 
 Secrets come only from the environment: `ANTHROPIC_API_KEY` (or `ant auth login`) and `GEMINI_API_KEY`.
+
+## Monitoring, logs and alerts
+
+ti2dac writes **JSON lines** (one event per line) so your SIEM can ingest its own activity. Events carry metadata
+only: ids, counts, models, tokens, durations and outcomes, never report text, prompts, model output, redaction maps
+or keys (anything shaped like an API key is replaced with `[SECRET]`).
+
+- **Where:** `.ti2dac/logs/ti2dac-web.jsonl` (the server) and `ti2dac-cli.jsonl` (commands), owner-readable only,
+  rotated at `log.max_mb` with `log.backups` old files kept. Forward them with your log agent, or set `log.syslog`
+  to send events straight to a syslog/SIEM collector. `log.json_stderr` also prints them for containers.
+- **Fields on every line:** `ts`, `level`, `event`, `component` (web/cli), `host`, `pid`, and `run_id`, `job_id`,
+  `request_id` when known. Responses carry the request id in `X-Request-ID`.
+- **The audit log is never deleted automatically.** It stays in the database and every entry is also an `audit` event.
+
+| Event | When | Useful for |
+|---|---|---|
+| `ai.call` | every AI request: `stage`, `provider`, `model`, `served_by`, `outcome` (ok, cached, refused, outage, truncated, error, paused, rate_limited, quota_exhausted, auth_error), `latency_ms`, tokens, `cost_usd` | AI request and token/cost metrics |
+| `ai.failover`, `ai.schema_retry` | failover to the second provider; a corrective re-ask | provider outage alerts |
+| `run.finish`, `run.failed`, `rule.failed` | each pipeline run, with rule counts, tokens and cost | failed-run alerts |
+| `job.start`, `job.finish` | web background jobs, with status and duration | job monitoring |
+| `audit` | every audit entry (`action`, `actor`, `details`), including `auth.failed` (wrong login), `access.denied` (role not allowed) and `csrf.refused` (cross-site request), at warning level | security monitoring |
+| `http.request` | every web request: method, path, status, user, client, duration | access log |
+| `cli.command` | each CLI command and the OS user | audit of operator actions |
+
+Example alert rules for your SIEM: `event=run.failed` or `event=job.finish status=failed`; `event=ai.call
+outcome=outage`; `event=audit action=auth.failed` more than 5 times from one `details.client` in 10 minutes;
+`event=audit action IN (ai.key.set, ai.key.remove, user.add, tlp.override)`.
+
+**Health:** `GET /healthz` (no login, so uptime checkers can poll it; no secrets in the answer) and `ti2dac health`
+check the database (`PRAGMA quick_check`), free disk space for the state and output folders (`health.min_free_mb`),
+the AI provider (no key, paused or down) and jobs running longer than `health.stuck_job_minutes`. Each check is
+ok, warn or fail; `/healthz` returns 503 and `ti2dac health` exits 1 when one fails. AI problems only warn, because
+everything except AI drafting keeps working.
 
 ## Web UI
 
@@ -349,6 +395,8 @@ output/<run-id>/
 | `feedback add / list / apply / resolve / export`, `lessons` | Feedback loop and the lessons learned from it |
 | `export`, `sigmahq-sync` | Hand-off to a detection repository; refresh the SigmaHQ duplicate index |
 | `ai-status [--reset]` | AI provider health: key configured, limits hit, requests today; clear a pause |
+| `health [--json]` | Database, disk space, AI provider and stuck jobs; exit code 1 when a check fails |
+| `model [<id>] [--provider P] [--stage S] [--refresh]` | List or choose the provider and model (same setting as the web AI page) |
 | `render <run> [--recheck]` | Rebuild a package; `--recheck` re-runs validation, conversion, self-tests and the safety lint with the current version (no AI, no tokens) |
 | `lint-sim`, `targets`, `runs`, `attack-update` | Utilities |
 | `serve`, `user add / list / remove` | Web UI and its users |
@@ -383,6 +431,8 @@ parser needs. `pySigma-backend-sqlite` must be `0.2.0`.
 Picture ti2dac as a small **detection factory**. A report comes in one end; a box of finished, labelled
 detection parts comes out the other. Each station does one job. Only two stations use AI. The others are
 ordinary, predictable code, so they behave the same every time and cost nothing to run.
+
+Printable flow diagram: [ti2dac-flow.svg](./ti2dac-flow.svg)
 
 ```
                          ┌──────────────────────────── your machine ─────────────────────────────┐

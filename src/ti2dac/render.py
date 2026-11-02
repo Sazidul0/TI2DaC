@@ -16,7 +16,7 @@ import yaml
 from . import attack, safety
 from . import sigma_tools as st
 from .feedback import CATEGORIES, TEST_RESULTS, target_status
-from .models import DetectionPackage, RunRecord
+from .models import DetectionPackage, RunRecord, Usage
 from .targets import TARGETS
 
 LAB_BANNER = ("> **LAB ONLY.** Run only in an isolated, snapshotted lab VM that does not forward to a production "
@@ -44,7 +44,14 @@ def save_record(record: RunRecord, out: Path) -> Path:
 
 
 def load_record(out: Path) -> RunRecord:
-    return RunRecord.model_validate_json((Path(out) / "run.json").read_text())
+    from .llm import price
+
+    record = RunRecord.model_validate_json((Path(out) / "run.json").read_text())
+    u = record.usage
+    if not u.unpriced_models:   # runs recorded before unpriced models were tracked showed them as $0
+        u.unpriced_models = sorted({str(s.get("model_price_key")) for s in u.by_stage.values()
+                                    if s.get("calls") and "cost_usd" not in s and price(str(s.get("model_price_key", ""))) is None})
+    return record
 
 
 def _status_label(p: DetectionPackage, results: list[dict]) -> dict[str, str]:
@@ -460,10 +467,32 @@ def _write_summary(record: RunRecord, out: Path, results: list[dict]) -> None:
     if items:
         L += ["## Warnings and unverified assumptions", "", *items, ""]
     if u.calls or u.cached_calls:
-        L += ["## AI usage", "",
-              f"{u.calls} API calls ({u.cached_calls} served from cache) · input {u.input_tokens:,} · output {u.output_tokens:,} · "
-              f"cache read {u.cache_read_tokens:,} tokens · est. ${u.estimated_cost_usd}", ""]
+        L += ["## AI usage", "", usage_summary(u), ""]
+        if len(u.by_stage) > 1 or u.unpriced_models:
+            L += ["| Stage | Model | Calls | Cached | Input | Output | Cache read | Cache write | Est. cost |",
+                  "|---|---|--:|--:|--:|--:|--:|--:|--:|"]
+            L += [f"| {name} | `{s.get('model_price_key', '')}` | {s.get('calls', 0)} | {s.get('cached_calls', 0)} | "
+                  f"{s.get('input_tokens', 0):,} | {s.get('output_tokens', 0):,} | {s.get('cache_read_tokens', 0):,} | "
+                  f"{s.get('cache_write_tokens', 0):,} | " + (f"${float(s['cost_usd']):.4f}" if "cost_usd" in s else "–") + " |"
+                  for name, s in u.by_stage.items()]
+            L.append("")
     (out / "report-summary.md").write_text("\n".join(L))
+
+
+def usage_summary(u: Usage) -> str:
+    """One line of AI usage for a run: calls, every token class, cost, and what the cost does not cover."""
+    parts = [f"{u.calls} API calls ({u.cached_calls} served from cache, free)",
+             f"input {u.input_tokens:,} · output {u.output_tokens:,} · cache read {u.cache_read_tokens:,} · "
+             f"cache write {u.cache_write_tokens:,} tokens"]
+    cost = f"est. ${u.estimated_cost_usd:.4f}"
+    if u.unpriced_models:
+        cost += f" (excludes unpriced {', '.join(u.unpriced_models)}; set ai.prices)" if u.estimated_cost_usd else \
+            f" — not priced: {', '.join(u.unpriced_models)} (set ai.prices)"
+    parts.append(cost)
+    extra = [f"{n} {label}" for n, label in ((u.fallback_calls, "answered by the refusal-fallback model"),
+                                             (u.failover_calls, "answered by the failover provider"),
+                                             (u.schema_retries, "schema re-asks")) if n]
+    return " · ".join(parts) + (f" · {'; '.join(extra)}" if extra else "")
 
 
 def _write_feedback_howto(record: RunRecord, out: Path) -> None:
