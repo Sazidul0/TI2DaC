@@ -1,0 +1,74 @@
+{% import "_ui.html" as ui %}
+{%- set path = request.url.path -%}
+<!doctype html>
+<html lang="en" class="no-js">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}ti2dac{% endblock %} · TI → Detection-as-Code</title>
+<script>try{var t=localStorage.getItem("ti2dac-theme");if(t)document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
+<link rel="stylesheet" href="/static/app.css?v={{ version }}">
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+{% block head %}{% endblock %}
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+    <a class="brand" href="/">
+      {{ ui.logo() }}
+      <span><span class="brand-name">ti2dac</span><br><span class="brand-sub">Threat intel → Sigma → SIEM</span></span>
+    </a>
+
+    <div class="nav-label">Workspace</div>
+    <nav class="nav">
+      <a href="/" {% if path == "/" or path.startswith("/runs") or path.startswith("/jobs") %}aria-current="page"{% endif %}>{{ ui.icon("runs") }}Runs</a>
+      <a href="/feedback" {% if path.startswith("/feedback") %}aria-current="page"{% endif %}>{{ ui.icon("feedback") }}Feedback &amp; lessons</a>
+      <a href="/ai" {% if path.startswith("/ai") %}aria-current="page"{% endif %}>{{ ui.icon("ai") }}AI provider</a>
+    </nav>
+    <div class="nav-label">Integrations</div>
+    <nav class="nav">
+      <a href="/api" {% if path == "/api" %}aria-current="page"{% endif %}>{{ ui.icon("api") }}API reference</a>
+    </nav>
+
+    <div class="sidebar-foot">
+      {%- set ai_tone = 'bad' if ai.blocked else 'ok' if ai.enabled and ai.key != 'not configured' else 'warn' if ai.enabled else 'muted' %}
+      <a class="ai-mini" href="/ai" title="AI provider status">
+        <div class="top"><span class="dot {{ ai_tone }}{{ ' pulse' if ai_tone == 'ok' }}"></span>
+          <span class="{{ 'bad' if ai.blocked }}">AI {{ 'paused' if ai.blocked else ('on: ' ~ ai.provider) if ai.enabled else 'off' }}</span></div>
+        {% if ai.enabled %}
+        <div class="sub" title="input / output tokens used today">{{ (ai.in_today + ai.out_today)|tok }} tokens today{% if ai.cost_today %} · ${{ "%.2f"|format(ai.cost_today) }}{% endif %}</div>
+        {% if ai.limit %}{% set pct = [100, (ai.requests_today * 100 / ai.limit)|round|int]|min %}
+        <div class="meter {{ 'bad' if pct >= 90 else 'warn' if pct >= 70 else '' }}" title="{{ ai.requests_today }} of {{ ai.limit }} requests today"><i style="width:{{ pct }}%"></i></div>
+        <div class="sub">{{ ai.requests_today }} / {{ ai.limit }} requests today</div>{% endif %}
+        {% else %}<div class="sub">Deterministic mode: no data leaves this machine</div>{% endif %}
+      </a>
+      <div class="user-row">
+        <span class="avatar" aria-hidden="true">{{ (user or "?")[:2] }}</span>
+        <span class="who"><b class="truncate">{{ user }}</b><span>{{ role }} · v{{ version }}</span></span>
+        <button type="button" class="btn ghost icon sm" data-theme-toggle title="Toggle light / dark theme" aria-label="Toggle theme">{{ ui.icon("moon", "theme-moon") }}{{ ui.icon("sun", "theme-sun") }}</button>
+      </div>
+    </div>
+  </aside>
+  <div class="scrim" data-nav-toggle></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button type="button" class="btn ghost icon sm menu-btn" data-nav-toggle aria-label="Open navigation">{{ ui.icon("menu") }}</button>
+      <nav class="crumbs" aria-label="Breadcrumb">{% block crumbs %}<span class="cur">{{ self.title() }}</span>{% endblock %}</nav>
+      <span class="spacer"></span>
+      {% block topbar_actions %}<a class="btn sm" href="/#new">{{ ui.icon("plus", "sm") }}New analysis</a>{% endblock %}
+    </header>
+
+    {% if ai.blocked %}<div class="banner bad" role="status">{{ ui.icon("pause") }}<div><strong>AI requests are paused</strong>: {{ ai.blocked }}
+      {% if ai.wait %}<span> (about {{ ai.wait }} left)</span>{% endif %}
+      Runs that need the AI are not started, so nothing is sent to {{ ai.provider }}. Conversion, replay, review and export still work.
+      <a href="/ai">Details &amp; setup</a></div></div>
+    {% elif ai.enabled and ai.key == 'not configured' %}<div class="banner warn" role="status">{{ ui.icon("key") }}<div>No API key configured for {{ ai.provider }}.
+      <a href="/ai#keys">Add one</a></div></div>{% endif %}
+
+    <main class="content" id="content">{% block content %}{% endblock %}</main>
+  </div>
+</div>
+<script src="/static/app.js?v={{ version }}" defer></script>
+</body>
+</html>

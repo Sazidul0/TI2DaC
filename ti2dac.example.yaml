@@ -1,0 +1,91 @@
+# Copy to ti2dac.yaml (or pass --config). Environment variables override:
+#   TI2DAC_AUTHOR, TI2DAC_OUTPUT_DIR, TI2DAC_STATE_DIR, TI2DAC_NO_AI=1, TI2DAC_MODEL
+# Secrets are never read from this file: ANTHROPIC_API_KEY (or `ant auth login`),
+# TI2DAC_WEB_USER / TI2DAC_WEB_PASSWORD.
+
+author: "SHL Detection Engineering"
+output_dir: output
+state_dir: .ti2dac          # SQLite feedback DB, response cache, ATT&CK index override
+select_count: 3             # behaviours turned into rules per report
+
+# Deterministic pySigma targets (`ti2dac targets` lists them all).
+targets:
+  - splunk
+  - splunk_cim
+  - elastic_lucene
+  - elastic_esql
+  - elastic_eql
+  - sentinel_asim
+  - sentinel_securityevent
+  - defender_xdr
+  - crowdstrike_cql
+  - qradar_aql
+  - opensearch
+  - loki
+
+# SIEMs without a pySigma backend. Each costs one small model call per rule and is
+# labelled "AI-translated (unverified)". Leave empty to spend zero tokens on translation.
+llm_targets: []
+#  - google_secops_yaral
+#  - sumologic
+
+# SIEM families that must always get a query. If no pySigma target of the family can convert a rule
+# (e.g. Sentinel/Defender for PowerShell 4104, service 7045 or scheduled-task 4698 rules), one AI call
+# writes it, labelled unverified. Remove a family to never spend tokens on it.
+ai_fill_gaps: [splunk, elastic, sentinel, defender, crowdstrike]
+
+# Log sources you actually collect ("product:category" or "product:service"). Passed to the model and
+# used to warn about rules that cannot fire in your environment. Empty = no check.
+telemetry: []
+#  - windows:process_creation
+#  - windows:registry_set
+#  - windows:security
+#  - windows:ps_script
+#  - linux:auditd
+
+# Scope queries to your indexes/tables.
+index_overrides: {}
+#  splunk: "index=wineventlog"
+#  elastic_esql: "logs-endpoint.events.*"
+
+# Existing internal Sigma rule folders to check new rules against (plus `ti2dac sigmahq-sync`).
+rule_repos: []
+
+# Pseudonymization applied before any AI call (always on; matters most for internal incident reports).
+redaction:
+  enabled: true
+  internal_domains: []      # your AD/DNS suffixes, e.g. [corp.local, example-corp.com]; also gives NetBIOS names
+  internal_networks: []     # CIDRs beyond RFC1918 that are yours, e.g. [203.0.113.0/24]
+  terms: []                 # customer / organisation / project names to replace
+  hostname_patterns: []     # regexes for single-segment host names, e.g. ['\bFINWS\d{3}\b']
+
+ai:
+  enabled: true
+  provider: anthropic            # or gemini (GEMINI_API_KEY); gemini_model applies to every stage
+  gemini_model: gemini-flash-latest
+  # Effort is the main quality/token lever. Extraction is mechanical; rule writing benefits from reasoning.
+  analyze:   {model: claude-opus-5-5, effort: medium, max_tokens: 16000}
+  generate:  {model: claude-opus-5-5, effort: high,   max_tokens: 24000}
+  repair:    {model: claude-opus-5-5, effort: medium, max_tokens: 8000}
+  translate: {model: claude-opus-5-5, effort: low,    max_tokens: 4000}
+  # TLP 2.0 policy: markings each provider may receive (after redaction). TLP:RED is never sent.
+  allowed_tlp:
+    anthropic: [clear, green, amber]
+    gemini: [clear, green]        # free tier may use prompts for training
+  # Limits: stop BEFORE the provider does. 0 = no cap. Example for a 20-requests/day free tier: 18.
+  daily_request_limit: 0
+  max_parallel: 0                 # 0 = auto (1 for gemini, 4 for anthropic)
+  default_tlp_threat_intel: clear # for unmarked documents
+  default_tlp_incident: amber
+  server_side_fallback: true     # re-run a declined request on Anthropic's recommended fallback model
+  max_repair_attempts: 2
+  input_token_budget: 6000       # report is condensed to ~this many tokens before analysis
+  max_behaviours: 10
+  response_cache: true           # identical request => served from .ti2dac/cache, zero tokens
+  max_lessons_in_prompt: 5
+
+fetch:
+  allow_urls: true
+  allowed_domains: []            # e.g. [thedfirreport.com, cisa.gov]; empty = any public host
+  max_bytes: 26214400
+  timeout_s: 30

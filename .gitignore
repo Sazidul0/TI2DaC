@@ -1,0 +1,28 @@
+# --- Python / tooling
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# --- Internal planning documents (kept locally, not published with the code)
+IMPLEMENTATION_PLAN.md
+TI-to-Detection-as-Code_30-Day_Plan_SHL_IIUC.pdf
+
+# --- Threat-report corpus: third-party copyrighted material, download locally
+report/
+
+# --- Local state and generated output (may contain internal data)
+# feedback DB, audit log, users.json (password hashes), LLM response cache
+.ti2dac/
+# detection packages; incident runs hold the original report and the redaction map
+output/
+# local config (internal domains, customer names)
+ti2dac.yaml
+.env
+
+# --- Never commit evidence or redaction artefacts by accident
+*.evtx
+redaction-map.json
+feedback.jsonl

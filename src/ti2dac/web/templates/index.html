@@ -1,0 +1,192 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}Runs{% endblock %}
+{% block crumbs %}<span class="cur">Runs</span>{% endblock %}
+{% block topbar_actions %}{% endblock %}
+{% block content %}
+{%- set n_rules = runs|sum(attribute="rules") -%}
+{%- set n_approved = runs|sum(attribute="approved") -%}
+<div class="page-head">
+  <div class="titles">
+    <h1>Detection runs</h1>
+    <p class="subtitle">Turn a threat-intel or incident report into ATT&amp;CK-mapped Sigma rules, SIEM queries for every backend,
+      and safe simulation guides, then review, test and approve them here.</p>
+  </div>
+</div>
+
+<div class="stats">
+  {{ ui.stat("Reports analysed", runs|length, "file") }}
+  {{ ui.stat("Rules generated", n_rules, "target", hint=(runs|sum(attribute="behaviours")) ~ " behaviours extracted") }}
+  {{ ui.stat("Approved rules", n_approved, "check-circle", "ok", sub=("of " ~ n_rules) if n_rules else "",
+             hint="Four-eyes: approver ≠ author") }}
+  {% if ai.enabled %}
+  {{ ui.stat("AI usage, all time", (ai.in_total + ai.out_total)|tok, "ai", sub="tokens",
+             hint="est. $" ~ ("%.2f"|format(ai.cost_total or 0)) ~ " · " ~ ai.provider) }}
+  {% else %}
+  {{ ui.stat("AI", "Off", "shield", "ok", hint="Deterministic mode: nothing is sent out") }}
+  {% endif %}
+</div>
+
+<div class="grid grid-dash">
+  <section class="card" id="new" aria-labelledby="new-title">
+    <div class="card-head">
+      <div>
+        <h2 id="new-title">{{ ui.icon("plus") }}New analysis</h2>
+        <p class="desc">Upload a report or point to a public URL. Behaviours are extracted first; you pick which become rules.</p>
+      </div>
+    </div>
+    <form id="new-run" class="card-body" method="post" action="/runs" enctype="multipart/form-data" data-busy>
+      {% if ai.blocked %}<div class="alert bad" style="margin-bottom:14px">{{ ui.icon("pause") }}<div><div class="alert-title">The AI is paused</div>
+        New analyses need the AI and will not start until the pause clears. <a href="/ai">See why</a></div></div>{% endif %}
+
+      <div data-tabs="new-source">
+        <div class="row" style="justify-content:space-between;margin-bottom:10px">
+          <span class="field-label">Report source</span>
+          <div class="segmented" role="tablist" aria-label="Report source">
+            <button type="button" role="tab" data-tab="upload" aria-selected="true">{{ ui.icon("upload", "sm") }}Upload file</button>
+            <button type="button" role="tab" data-tab="url">{{ ui.icon("link", "sm") }}Public URL</button>
+          </div>
+        </div>
+        <div role="tabpanel" data-panel="upload" class="active" style="padding:0">
+          <label class="dropzone">
+            <input type="file" name="file" accept=".html,.htm,.pdf,.md,.txt,.docx,.eml,.csv,.tsv" aria-label="Threat-intel report file">
+            <span class="dz-ico">{{ ui.icon("upload", "lg") }}</span>
+            <span class="dz-empty">
+              <span class="dz-title">Drop a report here or <u>browse</u></span><br>
+              <span class="xs muted">HTML, PDF, Word, Markdown, e-mail, text or CSV/TSV event exports</span>
+            </span>
+            <span class="dz-file">{{ ui.icon("file") }}<span class="dz-name"></span>
+              <button type="button" class="btn ghost sm" data-clear-file style="position:relative;z-index:2">{{ ui.icon("x", "sm") }}Remove</button></span>
+          </label>
+        </div>
+        <div role="tabpanel" data-panel="url" style="padding:0">
+          <label class="field">
+            <span class="sr-only">Public report URL</span>
+            <span class="input-icon">{{ ui.icon("link") }}<input class="input" type="url" name="url" placeholder="https://thedfirreport.com/2024/08/26/blacksuit-ransomware/"></span>
+            <span class="help">Fetched server-side. Use upload for anything internal or behind a login.</span>
+          </label>
+        </div>
+        <p class="xs bad" data-source-hint hidden style="margin:8px 0 0">Choose a file or enter a URL first.</p>
+      </div>
+
+      <div style="margin-top:18px">
+        <span class="field-label">Document type</span>
+        <div class="choices" style="margin-top:8px">
+          <label class="choice"><input type="radio" name="doc_type" value="auto" checked>
+            <span><b>Auto-detect</b><small>Decide from the content and TLP marking</small></span></label>
+          <label class="choice"><input type="radio" name="doc_type" value="threat-intel">
+            <span><b>Public threat intel</b><small>Vendor blog, advisory or DFIR write-up</small></span></label>
+          <label class="choice"><input type="radio" name="doc_type" value="incident">
+            <span><b>Internal incident</b><small>Treated as TLP:AMBER unless marked</small></span></label>
+        </div>
+      </div>
+
+      <details class="disclosure">
+        <summary>{{ ui.icon("chevron-right", "sm chev") }}Advanced options</summary>
+        <div class="body form-grid">
+          <label class="field"><span>Rules to generate</span>
+            <input class="input" type="number" name="count" value="3" min="1" max="10">
+            <span class="help">Top-ranked behaviours, 1–10. Each rule costs one AI call.</span></label>
+          <label class="field"><span>Specific behaviours</span>
+            <input class="input" type="text" name="select" placeholder="auto-select best">
+            <span class="help">Optional, e.g. <code>B1,B4</code>, when re-running a known report.</span></label>
+        </div>
+      </details>
+
+      <div class="alert info" style="margin-top:16px">{{ ui.icon("shield") }}<div class="xs">
+        The report is condensed locally before anything is sent to the model. Usernames, hosts, internal IPs, emails, SIDs, secrets and
+        configured customer names are redacted first, and the TLP policy is enforced. Simulations are generated, linted and documented,
+        never executed by this tool.</div></div>
+
+      <div class="form-actions">
+        <button type="submit" class="btn"><span class="spin"></span><span class="ico-default">{{ ui.icon("zap", "sm") }}</span>Analyse report</button>
+        <span class="xs muted">You can follow progress live; nothing is lost if you close the tab.</span>
+      </div>
+    </form>
+  </section>
+
+  <div class="stack">
+    <section class="card" aria-labelledby="jobs-title">
+      <div class="card-head"><h2 id="jobs-title">{{ ui.icon("clock") }}Recent jobs</h2></div>
+      <div class="card-body flush">
+        {% if jobs %}<ul class="list">
+        {% for j in jobs %}<li>
+          <span class="dot {{ ui.tone(j.status) }}{{ ' pulse' if j.status == 'running' }}" title="{{ j.status }}"></span>
+          <span class="grow"><a class="cell-title truncate" style="display:block" href="/jobs/{{ j.id }}">{{ j.label }}</a>
+            <span class="cell-sub">{{ ui.short_date(j.created_at) }} · {{ j.actor }}</span></span>
+          {{ ui.status(j.status, dot=False) }}
+        </li>{% endfor %}
+        </ul>
+        {% else %}{{ ui.empty("No jobs yet", "Analyses and AI fixes run in the background and show up here.", "clock") }}{% endif %}
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="siem-title">
+      <div class="card-head"><div><h2 id="siem-title">{{ ui.icon("database") }}SIEM coverage <span class="badge muted">{{ siems|length }}</span></h2>
+        <p class="desc">Every rule is converted for each of these. Set them in <code>ti2dac.yaml</code>.</p></div></div>
+      <div class="card-body">
+        {% if siems %}<div class="chips">{% for label, lang, ai_made in siems %}
+          <span class="badge sq {{ 'warn' if ai_made }}" title="{{ label }}{{ ' (AI-translated, unverified)' if ai_made else ' (pySigma backend, deterministic)' }}">
+            <span class="k">{{ lang }}</span>{{ label.split(' (')[0] }}{% if '(' in label %} <span class="k">{{ label.split(' (', 1)[1].rstrip(')') }}</span>{% endif %}</span>
+        {% endfor %}</div>
+        <p class="xs muted" style="margin:12px 0 0">Deterministic pySigma conversion costs no tokens.{% if siems|selectattr(2)|list %} <span class="warn">Amber</span> targets are AI-translated and unverified.{% endif %}</p>
+        {% else %}{{ ui.empty("No SIEM targets", "Add targets in ti2dac.yaml.", "database") }}{% endif %}
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="how-title">
+      <div class="card-head"><h2 id="how-title">{{ ui.icon("map") }}How a run works</h2></div>
+      <div class="card-body">
+        <ol class="steps">
+          <li><div><b>Condense &amp; redact locally</b><span>Sections, IOCs and sensitive values are stripped before the model sees anything.</span></div></li>
+          <li><div><b>Extract behaviours</b><span>TTPs mapped to ATT&amp;CK, with evidence quotes checked against the source.</span></div></li>
+          <li><div><b>Generate Sigma</b><span>Validated with pySigma, auto-repaired, compared with SigmaHQ for duplicates.</span></div></li>
+          <li><div><b>Convert &amp; self-test</b><span>Queries for every configured SIEM, plus a replay against expected events.</span></div></li>
+          <li><div><b>Review &amp; feed back</b><span>Approve with four-eyes, record lab tests, and turn corrections into lessons.</span></div></li>
+        </ol>
+      </div>
+    </section>
+  </div>
+</div>
+
+<section class="card" style="margin-top:16px" aria-labelledby="runs-title">
+  <div class="card-head">
+    <div><h2 id="runs-title">{{ ui.icon("runs") }}All runs <span class="badge muted">{{ runs|length }}</span></h2>
+      <p class="desc">Most recent first. Open a run to review its behaviours and rules.</p></div>
+    {% if runs %}<label class="input-icon" style="width:min(280px,100%)">{{ ui.icon("search") }}
+      <input class="input sm" type="search" placeholder="Filter by title, source or id" data-filter="#runs-table" aria-label="Filter runs"></label>{% endif %}
+  </div>
+  <div class="card-body flush">
+  {% if runs %}
+    <div class="table-wrap"><table class="table" id="runs-table">
+      <thead><tr><th>Report</th><th>Rules</th><th>Created</th><th class="num">AI calls</th><th class="num">Tokens in / out</th><th class="num">Est. cost</th><th class="shrink"><span class="sr-only">Actions</span></th></tr></thead>
+      <tbody>
+      {% for r in runs %}<tr data-row>
+        <td style="min-width:260px">
+          <a class="cell-title" href="/runs/{{ r.run_id }}">{{ r.title }}</a>
+          <div class="cell-sub row" style="gap:6px">
+            {% if r.kind == "incident" %}<span class="badge sq warn">incident</span>{% endif %}
+            {% if r.tlp %}<span class="badge sq {{ ui.tone(r.tlp) }}">{{ r.tlp }}</span>{% endif %}
+            {% set src = r.source or "" %}<span class="truncate" style="max-width:340px" title="{{ src }}">{{ src.split('/')[2] if src.startswith('http') and src.count('/') >= 2 else src }}</span>
+          </div>
+        </td>
+        <td class="nowrap">{% if r.rules %}<span class="cell-title">{{ r.rules }}</span> <span class="muted">/ {{ r.behaviours }} behaviours</span>
+          {% if r.approved %}<div class="cell-sub ok">{{ r.approved }} approved</div>{% endif %}
+          {% else %}<span class="muted">{{ r.behaviours }} behaviours, no rules</span>{% endif %}</td>
+        <td class="nowrap muted">{{ ui.short_date(r.created_at) }}</td>
+        <td class="num">{{ r.usage.calls or 0 }}{% if r.usage.cached_calls %} <span class="muted">(+{{ r.usage.cached_calls }} cached)</span>{% endif %}</td>
+        <td class="num">{{ r.usage.input_tokens|tok }} / {{ r.usage.output_tokens|tok }}</td>
+        <td class="num">{% if r.usage.estimated_cost_usd %}${{ "%.4f"|format(r.usage.estimated_cost_usd) }}{% else %}<span class="muted">-</span>{% endif %}</td>
+        <td class="shrink"><div class="row" style="flex-wrap:nowrap;gap:4px">
+          <a class="btn ghost icon sm" href="/runs/{{ r.run_id }}/download" title="Download package (zip)" aria-label="Download {{ r.title }} as zip">{{ ui.icon("download") }}</a>
+          <a class="btn outline sm" href="/runs/{{ r.run_id }}">Open{{ ui.icon("arrow-right", "sm") }}</a></div></td>
+      </tr>{% endfor %}
+      <tr data-filter-empty hidden><td colspan="7">{{ ui.empty("No matching runs", "Try a different word, or clear the filter.", "search") }}</td></tr>
+      </tbody>
+    </table></div>
+  {% else %}
+    {{ ui.empty("No runs yet", "Analyse your first report above. It takes a minute or two.", "runs") }}
+  {% endif %}
+  </div>
+</section>
+{% endblock %}

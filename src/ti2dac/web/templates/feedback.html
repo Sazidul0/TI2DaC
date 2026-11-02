@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}Feedback{% endblock %}
+{% block crumbs %}<span class="cur">Feedback &amp; lessons</span>{% endblock %}
+{% block content %}
+{%- set active_lessons = lessons|selectattr("active")|list|length -%}
+<div class="page-head">
+  <div class="titles">
+    <h1>Feedback &amp; lessons</h1>
+    <p class="subtitle">Reviewer corrections on generated rules. Applied feedback becomes a lesson that is injected into future generation
+      prompts for the same technique and log source.</p>
+  </div>
+  <div class="actions"><a class="btn outline" href="/feedback/export.jsonl">{{ ui.icon("download", "sm") }}Export JSONL (evaluation dataset)</a></div>
+</div>
+
+<section class="card" id="how" style="margin-bottom:20px">
+  <div class="card-head"><div><h2>{{ ui.icon("refresh") }}How feedback works</h2>
+    <p class="desc">One loop per mistake: the rule gets fixed now, and future rules avoid the same mistake.</p></div></div>
+  <div class="card-body">
+    <ol class="loop">
+      <li><span class="n">1</span><div><b>Report</b><span>On a rule's Feedback tab: what is wrong (artifact, category, severity) and why. Saved against that rule version.</span></div></li>
+      <li><span class="n">2</span><div><b>Fix</b><span>Paste a corrected rule (validated before it is accepted){% if ai_enabled %}, or let the AI rewrite it from your comment{% endif %}. The fix becomes the next version; the old one is kept in history.</span></div></li>
+      <li><span class="n">3</span><div><b>Re-review</b><span>The new version starts as a draft, queries are re-converted and test results reset. Someone other than its author approves it.</span></div></li>
+      <li><span class="n">4</span><div><b>Learn</b><span>The comment becomes a lesson, redacted and added to future generation prompts for the same ATT&amp;CK technique or log source.</span></div></li>
+    </ol>
+    <p class="xs muted" style="margin:12px 0 0">Feedback on behaviours, simulations or the ADS is recorded for evaluation (export below) but does not change prompts unless it is turned into a lesson.</p>
+  </div>
+</section>
+
+<div data-tabs="feedback-page">
+  <div class="segmented" role="tablist" aria-label="Sections" style="margin-bottom:16px">
+    <button type="button" role="tab" data-tab="items" aria-selected="true">{{ ui.icon("feedback", "sm") }}Feedback <span class="badge muted" style="height:18px">{{ items|length }}</span></button>
+    <button type="button" role="tab" data-tab="lessons">{{ ui.icon("book", "sm") }}Lessons <span class="badge muted" style="height:18px">{{ active_lessons }}/{{ lessons|length }}</span></button>
+    <button type="button" role="tab" data-tab="audit">{{ ui.icon("history", "sm") }}Audit log</button>
+  </div>
+
+  <div class="stack">
+  <section class="card active" role="tabpanel" data-panel="items" style="padding:0">
+    <div class="card-head">
+      <div><h2>Feedback</h2><p class="desc">{{ items|length }} item(s){% if status %} with status <b>{{ status }}</b>{% endif %}.</p></div>
+      <div class="segmented" aria-label="Filter by status">
+        <a href="/feedback" class="{{ 'active' if not status }}">All</a>
+        <a href="/feedback?status=open" class="{{ 'active' if status == 'open' }}">Open</a>
+        <a href="/feedback?status=applied" class="{{ 'active' if status == 'applied' }}">Applied</a>
+        <a href="/feedback?status=rejected" class="{{ 'active' if status == 'rejected' }}">Rejected</a>
+      </div>
+    </div>
+    <div class="card-body flush"><div class="table-wrap"><table class="table">
+      <thead><tr><th class="shrink">#</th><th>Status</th><th>Rule</th><th>Feedback</th><th>By</th><th>Resolution</th></tr></thead>
+      <tbody>
+      {% for f in items %}<tr>
+        <td class="muted">{{ f.id }}</td>
+        <td class="shrink">{{ ui.status(f.status) }}<div style="margin-top:6px"><span class="badge sq {{ ui.tone(f.severity) }}">{{ f.severity }}</span></div></td>
+        <td style="min-width:180px"><a class="cell-title" href="/runs/{{ f.run_id }}#{{ f.slug }}">{{ f.slug }} v{{ f.rule_version }}</a>
+          <div class="cell-sub truncate" style="max-width:240px" title="{{ f.run_id }}">{{ f.run_id }}</div></td>
+        <td style="min-width:260px"><div class="xs muted">{{ f.artifact }}{% if f.target %} ({{ f.target }}){% endif %} · {{ categories.get(f.category, f.category) }}</div>
+          <div style="margin-top:3px">{{ f.comment }}</div></td>
+        <td class="nowrap">{{ f.reviewer }}<div class="cell-sub">{{ ui.short_date(f.created_at) }}</div></td>
+        <td class="muted">{{ f.resolution or "" }}</td>
+      </tr>
+      {% else %}<tr><td colspan="6">{{ ui.empty("No feedback yet" if not status else "Nothing " ~ status, "Open a rule and use its Feedback tab to report a mistake.", "feedback") }}</td></tr>{% endfor %}
+      </tbody>
+    </table></div></div>
+  </section>
+
+  <section class="card" role="tabpanel" data-panel="lessons" id="lessons" style="padding:0">
+    <div class="card-head"><div><h2>Lessons</h2><p class="desc">Injected into future generation prompts. Disable a lesson that turned out to be wrong.</p></div></div>
+    <div class="card-body flush"><div class="table-wrap"><table class="table">
+      <thead><tr><th class="shrink">#</th><th>Technique</th><th>Log source</th><th>Lesson</th><th class="shrink">From</th><th class="shrink">Active</th></tr></thead>
+      <tbody>
+      {% for l in lessons %}<tr>
+        <td class="muted">{{ l.id }}</td>
+        <td class="nowrap"><a class="badge sq primary" href="https://attack.mitre.org/techniques/{{ l.technique_id|replace('.', '/') }}/" target="_blank" rel="noopener">{{ l.technique_id }}</a></td>
+        <td class="nowrap"><span class="tag">{{ l.product }}/{{ l.category }}</span></td>
+        <td>{{ l.text }}</td>
+        <td class="shrink muted nowrap">#{{ l.feedback_id }}<div class="cell-sub">{{ ui.short_date(l.created_at) }}</div></td>
+        <td class="shrink"><form method="post" action="/lessons/{{ l.id }}/toggle" class="row" style="flex-wrap:nowrap">
+          <input type="hidden" name="active" value="{{ 0 if l.active else 1 }}">
+          {{ ui.status("active" if l.active else "disabled", "ok" if l.active else "muted") }}
+          <button class="btn ghost sm">{{ "Disable" if l.active else "Enable" }}</button></form></td>
+      </tr>
+      {% else %}<tr><td colspan="6">{{ ui.empty("No lessons yet", "Applied feedback becomes a lesson.", "book") }}</td></tr>{% endfor %}
+      </tbody>
+    </table></div></div>
+  </section>
+
+  <section class="card" role="tabpanel" data-panel="audit" style="padding:0">
+    <div class="card-head"><div><h2>Audit log</h2><p class="desc">Last 100 state-changing actions.</p></div></div>
+    <div class="card-body flush"><div class="table-wrap"><table class="table compact">
+      <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Details</th></tr></thead>
+      <tbody>
+      {% for a in audit %}<tr><td class="muted nowrap">{{ ui.short_date(a.ts) }}</td><td class="nowrap">{{ a.actor }}</td><td class="nowrap"><span class="tag mono">{{ a.action }}</span></td>
+        <td><code style="font-size:11.5px">{{ a.details }}</code></td></tr>
+      {% else %}<tr><td colspan="4">{{ ui.empty("No audit entries", "", "history") }}</td></tr>{% endfor %}
+      </tbody>
+    </table></div></div>
+  </section>
+  </div>
+</div>
+{% endblock %}

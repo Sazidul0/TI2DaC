@@ -1,0 +1,150 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}AI settings{% endblock %}
+{% block crumbs %}<span class="cur">AI provider</span>{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div class="titles">
+    <h1>AI provider</h1>
+    <p class="subtitle">Which model ti2dac uses, its API keys, how much it has used, and whether requests are currently allowed.</p>
+  </div>
+  {% if ai.state != 'ok' and role == 'admin' %}
+  <div class="actions"><form method="post" action="/ai/reset"><button class="btn outline">{{ ui.icon("refresh", "sm") }}Clear pause (after fixing the cause)</button></form></div>
+  {% endif %}
+</div>
+
+{% if just_blocked %}<div class="alert bad" style="margin-bottom:16px">{{ ui.icon("pause") }}<div><div class="alert-title">That action needs the AI, which is paused right now.</div>
+  No request was sent. Details below.</div></div>{% endif %}
+
+{%- set pct = ([100, (ai.requests_today * 100 / ai.limit)|round|int]|min) if ai.limit else 0 -%}
+<div class="stats">
+  <div class="stat">
+    {%- set no_key = ai.enabled and ai.key == 'not configured' and ai.state == 'ok' %}
+    <div class="label"><span class="ico {{ 'bad' if no_key else ui.tone(ai.state) if ai.state != 'ok' else 'ok' }}">{{ ui.icon("ai", "sm") }}</span>Status</div>
+    <div class="value {{ 'bad' if no_key }}" style="font-size:20px">{{ 'no key' if no_key else ai.state.replace('_', ' ') if ai.enabled else 'disabled' }}</div>
+    <div class="hint">{% if not ai.enabled %}Deterministic mode{% elif ai.retry_at %}resets at {{ ai.retry_at }} UTC{% if ai.wait %} (about {{ ai.wait }}){% endif %}{% else %}{{ ai.provider }}{% endif %}</div>
+  </div>
+  <div class="stat">
+    <div class="label"><span class="ico">{{ ui.icon("zap", "sm") }}</span>Requests today</div>
+    <div class="value">{{ ai.requests_today }}{% if ai.limit %} <small>of {{ ai.limit }}</small>{% endif %}</div>
+    {% if ai.limit %}<div class="meter {{ 'bad' if pct >= 90 else 'warn' if pct >= 70 else '' }}" style="margin-top:6px"><i style="width:{{ pct }}%"></i></div>
+    {% else %}<div class="hint">No cap set: <code>ai.daily_request_limit</code></div>{% endif %}
+  </div>
+  {{ ui.stat("Tokens today", (ai.in_today + ai.out_today)|tok, "cpu", hint="{:,}".format(ai.in_today) ~ " input · " ~ "{:,}".format(ai.out_today) ~ " output") }}
+  {{ ui.stat("Spend, all time", "$" ~ ("%.2f"|format(ai.cost_total or 0)), "dollar", hint=((ai.in_total + ai.out_total)|tok) ~ " tokens · list-price estimate") }}
+</div>
+
+<section class="card" id="keys" style="margin-bottom:16px" aria-labelledby="keys-title">
+  <div class="card-head"><div><h2 id="keys-title">{{ ui.icon("key") }}API keys</h2>
+    <p class="desc">Stored in the server's <code>{{ env_path }}</code> (git-ignored, owner-only), never in the database, and never shown again.
+      A new key is used by the next job; no restart needed.</p></div></div>
+  {% if insecure %}<div class="issues" style="margin-top:12px"><div class="alert bad">{{ ui.icon("alert") }}<div><div class="alert-title">This page is not encrypted</div>
+    You reached ti2dac over plain HTTP on a network address, so a key typed here would cross the network in clear text.
+    Put it behind HTTPS (a reverse proxy) or set the key on the server instead.</div></div></div>{% endif %}
+  <div class="card-body flush">
+  {% for k in keys %}
+    <div class="keyrow">
+      <div class="row" style="justify-content:space-between">
+        <div class="row" style="gap:8px"><b>{{ k.label }}</b>{% if k.active %}<span class="badge primary">active provider</span>{% endif %}</div>
+        <div class="row" style="gap:6px">
+          {% if k.source %}{{ ui.status("set " ~ k.tail, "ok") }}<span class="badge sq muted" title="{{ 'Written by this page or by hand to the .env file' if k.source == '.env' else 'Exported in the shell or service that started ti2dac' }}">from {{ k.source }}</span>
+          {% else %}{{ ui.status("not set", "bad" if k.active else "muted") }}{% endif %}
+          <code class="xs" style="background:none">{{ k.var }}</code>
+        </div>
+      </div>
+      {% if k.check %}<div class="alert {{ 'ok' if k.check.ok else 'bad' if k.check.ok is sameas false else 'info' }}" style="margin-top:12px" role="status">
+        {{ ui.icon("check-circle" if k.check.ok else "x" if k.check.ok is sameas false else "info") }}<div style="min-width:0;word-break:break-word">{{ k.check.message }}
+        <span class="xs muted">· {{ k.check.by }} at {{ k.check.at }}</span></div></div>{% endif %}
+      {% if role == "admin" %}
+      <form method="post" action="/ai/key" class="key-form" autocomplete="off">
+        <input type="hidden" name="provider" value="{{ k.provider }}">
+        <input class="input" type="password" name="key" autocomplete="new-password" spellcheck="false" aria-label="{{ k.label }} API key"
+               placeholder="{{ 'Replace' if k.source else 'Paste' }} key: {{ 'sk-ant-api03-…' if k.provider == 'anthropic' else 'AIza…' }}">
+        <button class="btn" name="action" value="save">{{ ui.icon("check", "sm") }}Save &amp; test</button>
+        {% if k.source %}<button class="btn outline" name="action" value="test" title="Lists models: uses no tokens or generation quota">{{ ui.icon("refresh", "sm") }}Test</button>{% endif %}
+        {% if k.source == ".env" %}<button class="btn danger" name="action" value="remove" title="Delete it from .env">{{ ui.icon("x", "sm") }}Remove</button>{% endif %}
+      </form>
+      {% if k.source == "environment" %}<p class="xs muted" style="margin:8px 0 0">This key comes from the server's environment. Saving here overrides it until the next restart,
+        when the environment value wins again; change it where ti2dac is started to make it permanent.</p>{% endif %}
+      {% endif %}
+    </div>
+  {% endfor %}
+  {% if role != "admin" %}<p class="xs muted" style="padding:0 20px 16px;margin:0">Only admins can add or change keys.</p>{% endif %}
+  </div>
+</section>
+
+<div class="grid grid-2" style="align-items:start">
+  <section class="card">
+    <div class="card-head"><h2>{{ ui.icon("cpu") }}Configuration</h2></div>
+    <div class="card-body stack">
+      <dl class="kv">
+        <dt>Provider</dt><dd><strong>{{ ai.provider }}</strong> · AI {{ "enabled" if ai.enabled else "disabled (deterministic mode)" }}</dd>
+        <dt>Credentials</dt><dd>{{ ui.status(ai.key, 'bad' if ai.key == 'not configured' else 'ok') }} <span class="xs muted">(the key itself is never shown)</span></dd>
+        <dt>Status</dt><dd>{{ ui.status(ai.state, 'ok' if ai.state == 'ok' else 'warn' if ai.state == 'refused' else 'bad') }}
+          {% if ai.retry_at %}<span class="xs muted"> resets at {{ ai.retry_at }} UTC{% if ai.wait %} (about {{ ai.wait }}){% endif %}</span>{% endif %}</dd>
+        <dt>Requests today</dt><dd>{{ ai.requests_today }}{% if ai.limit %} of your cap {{ ai.limit }}{% else %} <span class="muted">(no cap set: <code>ai.daily_request_limit</code>)</span>{% endif %}</dd>
+        <dt>Tokens today</dt><dd>{{ "{:,}".format(ai.in_today) }} input · {{ "{:,}".format(ai.out_today) }} output
+          {% if ai.cache_today %}· {{ "{:,}".format(ai.cache_today) }} cache read{% endif %}
+          · est. ${{ "%.4f"|format(ai.cost_today or 0) }}</dd>
+        <dt>Tokens all time</dt><dd>{{ "{:,}".format(ai.in_total) }} input · {{ "{:,}".format(ai.out_total) }} output
+          · est. ${{ "%.4f"|format(ai.cost_total or 0) }} <div class="xs muted">Estimates from list prices; $0 for models without a price, e.g. Gemini.</div></dd>
+        {% if ai.last_success %}<dt>Last success</dt><dd>{{ ai.last_success }}</dd>{% endif %}
+        {% if ai.message %}<dt>Last error</dt><dd><code>{{ ai.message }}</code></dd>{% endif %}
+      </dl>
+      <div><div class="section-title">Models per stage</div>
+        <div class="models">{% for k, v in ai.models.items() %}<div><div class="k">{{ k }}</div><code>{{ v }}</code></div>{% endfor %}</div></div>
+      {% if ai.blocked %}<div class="alert bad">{{ ui.icon("pause") }}<div><div class="alert-title">{{ ai.blocked }}</div>
+        While paused, nothing is sent to the provider: repeated requests after a "quota exhausted" answer waste quota and can be treated as
+        abuse by the provider. Everything that does not need the AI (conversion, replay, review, feedback with a corrected rule, export) keeps working.</div></div>{% endif %}
+      {% if ai.state != 'ok' and role != 'admin' %}<p class="xs muted" style="margin:0">An admin can clear the pause after the cause is fixed (new key, quota reset, billing).</p>{% endif %}
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><div><h2>{{ ui.icon("info") }}What the states mean</h2><p class="desc">How ti2dac protects your quota when the provider pushes back.</p></div></div>
+    <div class="card-body flush"><div class="table-wrap"><table class="table">
+      <thead><tr><th>State</th><th>Meaning</th><th>What happens</th></tr></thead>
+      <tbody>
+      <tr><td class="shrink">{{ ui.status("rate limited", "warn") }}</td><td>Too many requests per minute</td><td class="muted">Paused until the provider's retry time (usually seconds to a minute), then resumes by itself</td></tr>
+      <tr><td class="shrink">{{ ui.status("quota exhausted", "bad") }}</td><td>Daily/free-tier quota, credit balance or spend limit used up</td><td class="muted">Paused until the reset time the provider gave; no retries</td></tr>
+      <tr><td class="shrink">{{ ui.status("daily cap", "bad") }}</td><td>Your own <code>ai.daily_request_limit</code> reached</td><td class="muted">Paused until local midnight</td></tr>
+      <tr><td class="shrink">{{ ui.status("auth error", "bad") }}</td><td>Key missing, invalid or without permission</td><td class="muted">Paused until fixed and cleared</td></tr>
+      <tr><td class="shrink">{{ ui.status("refused", "warn") }}</td><td>The model declined one request (safety filter)</td><td class="muted">Not a pause; that rule is skipped with a warning</td></tr>
+      </tbody>
+    </table></div></div>
+  </section>
+</div>
+
+<h2 style="margin:28px 0 12px">Setting up a key</h2>
+<div class="grid grid-2" style="align-items:start">
+  <section class="card">
+    <div class="card-head"><h2>{{ ui.icon("key") }}Claude (Anthropic)</h2><span class="badge primary">Recommended</span></div>
+    <div class="card-body">
+      <ol class="steps">
+        <li><div>Sign in at <code>console.anthropic.com</code> with your company account, add billing, and create a key under <em>API keys</em> (one key per environment).</div></li>
+        <li><div>Optional: set a monthly spend limit for the workspace in the Console.</div></li>
+        <li><div style="min-width:0;flex:1">Paste it under <a href="#keys">API keys</a> above, or put it in <code>.env</code> yourself, export it in your shell, or run <code>ant auth login</code>:
+          <div style="margin-top:6px">{{ ui.code("ANTHROPIC_API_KEY=sk-ant-...") }}</div></div></li>
+        <li><div>Check it with <em>Test</em> above or <code>ti2dac ai-status</code>.</div></li>
+      </ol>
+      <p class="xs muted" style="margin:14px 0 0">A Claude.ai or Claude Code subscription is not an API key: API usage is billed separately in the Console.</p>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-head"><h2>{{ ui.icon("key") }}Gemini (Google AI Studio)</h2></div>
+    <div class="card-body">
+      <ol class="steps">
+        <li><div>Create a key at <code>aistudio.google.com</code> → <em>Get API key</em>, in a Google Cloud project with <strong>billing enabled</strong> (paid tier).</div></li>
+        <li><div style="min-width:0;flex:1">Install the extra:<div style="margin-top:6px">{{ ui.code('pip install -e ".[gemini]"') }}</div></div></li>
+        <li><div style="min-width:0;flex:1">Paste the key under <a href="#keys">API keys</a> above, and select Gemini as the provider in <code>.env</code> (then restart):
+          <div style="margin-top:6px">{{ ui.code("TI2DAC_PROVIDER=gemini") }}</div></div></li>
+        <li><div>Optional, recommended on low quotas: <code>ai.daily_request_limit</code> in <code>ti2dac.yaml</code> a little under your quota.</div></li>
+      </ol>
+      <div class="alert warn" style="margin-top:14px">{{ ui.icon("alert") }}<div class="xs">Free-tier keys: about 20 requests/day, prompts may be used by Google, and attack-simulation content can trip
+        abuse filters. Use them only for public reports and light testing.</div></div>
+    </div>
+  </section>
+</div>
+<p class="xs muted" style="margin-top:14px">{{ ui.icon("shield", "sm") }} Keys set here go to the server's <code>.env</code> file, never to the database or the audit log
+  (which records only who changed which provider's key, and its last 4 characters). Prefer HTTPS when the server is not on localhost.</p>
+{% endblock %}

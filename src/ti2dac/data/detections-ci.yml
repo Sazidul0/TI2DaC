@@ -1,0 +1,42 @@
+# Detection-as-code CI (written by `ti2dac export`). Every pull request that changes rules must:
+#   1. pass Sigma validation, 2. pass the rule unit tests (positive + benign test events),
+#   3. still convert for every configured SIEM. Merge only after review by a second engineer.
+name: detections
+
+on:
+  pull_request:
+    paths: ["rules/**", "tests/**"]
+  push:
+    branches: [main]
+    paths: ["rules/**", "tests/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ti2dac
+        # Pin to your internal ti2dac release (git tag or private index).
+        run: pip install "ti2dac @ git+https://github.com/YOUR-ORG/ti2dac@v0.1.0"
+      - name: Sigma validation
+        run: ti2dac check $(find rules -name '*.yml')
+        env:
+          TI2DAC_NO_AI: "1"
+      - name: Rule unit tests (simulation events must match, benign look-alikes must not)
+        run: ti2dac rule-test rules tests
+        env:
+          TI2DAC_NO_AI: "1"
+      - name: Multi-SIEM conversion
+        run: ti2dac convert $(find rules -name '*.yml') --out build/queries
+        env:
+          TI2DAC_NO_AI: "1"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: siem-queries
+          path: build/queries

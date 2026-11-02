@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}Job {{ job.id }}{% endblock %}
+{% block head %}{% if job.status == "running" %}<noscript><meta http-equiv="refresh" content="2"></noscript>{% endif %}{% endblock %}
+{% block crumbs %}<a href="/">Runs</a>{{ ui.icon("chevron-right", "sm") }}<span class="cur">Job {{ job.id }}</span>{% endblock %}
+{% block content %}
+<div style="max-width:820px;margin:0 auto" data-job="{{ job.id }}">
+  <div class="page-head">
+    <div class="titles">
+      <h1 style="word-break:break-word">{{ job.label }}</h1>
+      <div class="meta">
+        <span id="job-status" data-job-status class="badge {{ ui.tone(job.status) }}"><span class="dot {{ ui.tone(job.status) }}{{ ' pulse' if job.status == 'running' }}"></span>{{ job.status }}</span>
+        <span>{{ ui.icon("clock", "sm") }}started {{ ui.short_date(job.created_at) }}</span>
+        {% if job.actor %}<span>{{ ui.icon("user", "sm") }}{{ job.actor }}</span>{% endif %}
+        {% if job.status == "running" %}<span data-job-live><span class="spin" style="width:12px;height:12px;border-width:1.5px"></span>updating live</span>{% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="alert bad" data-job-error {{ 'hidden' if not job.error }} style="margin-bottom:16px">{{ ui.icon("x") }}<div style="min-width:0">
+    <div class="alert-title">The job failed</div><div data-msg style="word-break:break-word">{{ job.error }}</div>
+    <div class="xs muted" style="margin-top:6px">Nothing was published. If this was an AI quota or key problem, check <a href="/ai">AI provider</a>, then try again.</div></div></div>
+
+  <section class="card">
+    <div class="card-head"><div><h2>{{ ui.icon("list") }}Progress</h2>
+      <p class="desc">This page opens the finished run automatically. You can leave; the job keeps running on the server.</p></div></div>
+    <div class="card-body">
+      <ol class="timeline">
+        {% for l in job.log %}
+        <li class="{{ 'current' if loop.last and job.status == 'running' else 'failed' if loop.last and job.status == 'failed' else '' }}">
+          <span class="tl-ico">{% if loop.last and job.status == 'running' %}<span class="spin"></span>{% elif loop.last and job.status == 'failed' %}{{ ui.icon("x") }}{% else %}{{ ui.icon("check") }}{% endif %}</span>
+          <span class="tl-text">{{ l }}</span></li>
+        {% else %}
+        <li class="current"><span class="tl-ico"><span class="spin"></span></span><span class="tl-text">Waiting for the first step…</span></li>
+        {% endfor %}
+      </ol>
+    </div>
+  </section>
+
+  <div class="form-actions">
+    <a class="btn outline" href="/">{{ ui.icon("arrow-left", "sm") }}Back to runs</a>
+    {% if job.run_id %}<a class="btn" href="/runs/{{ job.run_id }}">Open run{{ ui.icon("arrow-right", "sm") }}</a>{% endif %}
+  </div>
+</div>
+{% endblock %}

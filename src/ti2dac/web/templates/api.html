@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}API{% endblock %}
+{% block crumbs %}<span class="cur">API reference</span>{% endblock %}
+{% block content %}
+{%- set auth = "-u USER:PASSWORD " if needs_auth else "" -%}
+{%- macro fill(path) -%}{{ path.replace("{run_id}", samples.run_id or "{run_id}").replace("{jid}", samples.jid or "{jid}") }}{%- endmacro -%}
+{%- macro curl(e) -%}
+{%- set url = base ~ fill(e.path) -%}
+{%- if e.method == "GET" -%}
+curl {{ auth }}{{ "-OJ " if e.path.endswith(("download", ".jsonl")) }}"{{ url }}"
+{%- else -%}
+curl {{ auth }}-X POST "{{ url }}"{% for f in e.fields if f.where in ("form", "file") %} \
+  -F {% if f.where == "file" %}"{{ f.name }}=@report.pdf"{% else %}"{{ f.name }}=&lt;{{ f.type or "value" }}&gt;"{% endif %}{% endfor %}
+{%- endif -%}
+{%- endmacro -%}
+
+<div class="page-head">
+  <div class="titles">
+    <h1>API reference</h1>
+    <p class="subtitle">Drive ti2dac from a SOAR playbook, CI pipeline or script: start analyses, poll jobs, pull rules and queries,
+      and record reviews and test results. Every action in this UI is an HTTP call you can make yourself.</p>
+  </div>
+  <div class="actions"><a class="btn outline" href="/openapi.json" target="_blank" rel="noopener">{{ ui.icon("download", "sm") }}openapi.json</a></div>
+</div>
+
+<div class="grid grid-2" style="margin-bottom:20px">
+  <div class="alert {{ 'info' if needs_auth else 'warn' }}">{{ ui.icon("key") }}<div>
+    <div class="alert-title">Authentication</div>
+    {% if needs_auth %}HTTP Basic auth with a ti2dac user (<code>ti2dac user add</code>). Approvals need the approver role.
+    {% else %}Local single-user mode: no login, loopback only. Add users with <code>ti2dac user add</code> before exposing the server.{% endif %}
+  </div></div>
+  <div class="alert info">{{ ui.icon("shield") }}<div>
+    <div class="alert-title">Conventions</div>
+    Actions take form fields (<code>-F</code>) and answer <code>303</code> with a <code>Location</code>; long work returns a job to poll at
+    <code>/api/jobs/{jid}</code>. Cross-origin browser posts are refused; scripts without an <code>Origin</code> header are fine.
+  </div></div>
+</div>
+
+{% for key, title, ico, desc in [
+    ("json", "JSON API", "api", "Read-only, machine-friendly. Start here for integrations."),
+    ("actions", "Actions", "zap", "State-changing calls, the same ones the UI's forms make."),
+    ("files", "Files & exports", "download", "Generated artefacts and datasets.")] if groups[key] %}
+<section class="card" style="margin-bottom:16px" aria-labelledby="g-{{ key }}">
+  <div class="card-head"><div><h2 id="g-{{ key }}">{{ ui.icon(ico) }}{{ title }} <span class="badge muted">{{ groups[key]|length }}</span></h2>
+    <p class="desc">{{ desc }}</p></div></div>
+  <div class="card-body flush">
+    <ul class="list endpoints">
+    {% for e in groups[key] %}
+      <li><details class="endpoint">
+        <summary>
+          <span class="badge sq method {{ 'get' if e.method == 'GET' else 'post' }}">{{ e.method }}</span>
+          <code class="path">{{ e.path }}</code>
+          <span class="desc">{{ e.doc.replace('`', '') }}</span>
+          {{ ui.icon("chevron-right", "sm chev") }}
+        </summary>
+        <div class="ep-body">
+          {% if e.doc %}<div class="md small">{{ e.doc|md }}</div>{% endif %}
+          {% if e.fields %}
+          <div class="section-title" style="margin-top:12px">Parameters</div>
+          <div class="chips">{% for f in e.fields %}
+            <span class="badge sq" title="{{ f.where }}{{ ', required' if f.required }}"><span class="k">{{ f.where }}</span><span class="mono">{{ f.name }}</span>{% if f.type %}<span class="k">{{ f.type }}</span>{% endif %}{% if f.required %}<span class="bad">*</span>{% endif %}</span>
+          {% endfor %}</div>{% endif %}
+          <div class="code" style="margin-top:12px">
+            <div class="code-bar"><span class="title xs muted">Example</span><span class="spacer"></span>
+              {% if e.method == "GET" and "{" not in fill(e.path) %}<a class="btn ghost sm" href="{{ fill(e.path) }}" target="_blank" rel="noopener">{{ ui.icon("external", "sm") }}Open</a>{% endif %}
+              {{ ui.copy_btn() }}</div>
+            <pre>{{ curl(e) }}</pre>
+          </div>
+        </div>
+      </details></li>
+    {% endfor %}
+    </ul>
+  </div>
+</section>
+{% endfor %}
+
+<section class="card" aria-labelledby="flow-title">
+  <div class="card-head"><div><h2 id="flow-title">{{ ui.icon("play") }}Typical automation</h2>
+    <p class="desc">Analyse a report, wait for the job, then fetch the rules.</p></div></div>
+  <div class="card-body">
+    {{ ui.code('# 1. start an analysis (prints the job URL in the Location header)
+curl -s -o /dev/null -w "%{redirect_url}\\n" ' ~ auth ~ '-X POST "' ~ base ~ '/runs" -F "url=https://thedfirreport.com/..." -F "count=3"
+
+# 2. poll the job until status is "done", then read run_id
+curl -s ' ~ auth ~ '"' ~ base ~ '/api/jobs/<jid>"
+
+# 3. fetch the run record (rules, queries, review status) or the shareable package
+curl -s ' ~ auth ~ '"' ~ base ~ '/api/runs/<run_id>"
+curl -OJ ' ~ auth ~ '"' ~ base ~ '/runs/<run_id>/download"') }}
+  </div>
+</section>
+{% endblock %}

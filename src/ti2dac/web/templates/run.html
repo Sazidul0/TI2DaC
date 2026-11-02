@@ -1,0 +1,369 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}{{ r.report.title }}{% endblock %}
+{% block crumbs %}<a href="/">Runs</a>{{ ui.icon("chevron-right", "sm") }}<span class="cur">{{ r.report.title }}</span>{% endblock %}
+{% block content %}
+{%- set ns = namespace(q_ok=0, q_all=0, st_pass=0, approved=0, ev_ok=0, ev_all=0) -%}
+{%- for p in r.packages -%}
+  {%- set ns.q_ok = ns.q_ok + (p.queries|selectattr("query")|list|length) -%}
+  {%- set ns.q_all = ns.q_all + (p.queries|length) -%}
+  {%- if p.selftest == "pass" %}{% set ns.st_pass = ns.st_pass + 1 %}{% endif -%}
+  {%- if p.review_status == "approved" %}{% set ns.approved = ns.approved + 1 %}{% endif -%}
+{%- endfor -%}
+{%- for b in r.behaviours -%}
+  {%- set ns.ev_ok = ns.ev_ok + (b.evidence_verified|select|list|length) -%}
+  {%- set ns.ev_all = ns.ev_all + (b.evidence|length) -%}
+{%- endfor -%}
+{%- set max_rank = (r.behaviours|map(attribute="rank_score")|max) if r.behaviours else 0 -%}
+{%- set n_rules = r.packages|length -%}
+
+<div class="page-head">
+  <div class="titles">
+    <h1>{{ r.report.title }}</h1>
+    <div class="meta">
+      {% if r.report.kind == "incident" %}<span class="badge sq warn">{{ ui.icon("alert", "sm") }}internal incident</span>
+      {% else %}<span class="badge sq muted">threat intel</span>{% endif %}
+      {% if r.report.tlp_effective %}<span class="badge sq {{ ui.tone(r.report.tlp_effective) }}" title="{{ 'Marking found in the document' if r.report.tlp else 'Configured default (document unmarked)' }}{{ ' · overridden: ' ~ r.report.tlp_override if r.report.tlp_override }}">{{ r.report.tlp_effective }}</span>{% endif %}
+      {% if r.report.url %}<span>{{ ui.icon("link", "sm") }}<a href="{{ r.report.url }}" target="_blank" rel="noopener noreferrer">{{ r.report.url.split('/')[2] if r.report.url.count('/') >= 2 else r.report.url }}</a></span>
+      {% else %}<span>{{ ui.icon("file", "sm") }}{{ r.report.source }}</span>{% endif %}
+      <span>{{ ui.icon("clock", "sm") }}{{ ui.short_date(r.created_at) }}</span>
+      {% if r.created_by %}<span>{{ ui.icon("user", "sm") }}{{ r.created_by }}</span>{% endif %}
+    </div>
+  </div>
+  <div class="actions">
+    {{ ui.copy_btn(r.run_id, "Copy run ID", "btn outline") }}
+    <a class="btn" href="/runs/{{ r.run_id }}/download" title="Rules, queries, simulations and docs. Never includes the source report or raw evidence.">{{ ui.icon("download", "sm") }}Download package</a>
+  </div>
+</div>
+
+<div class="stats">
+  {{ ui.stat("Behaviours", r.behaviours|length, "list",
+             hint=(ns.ev_ok ~ " of " ~ ns.ev_all ~ " evidence quotes verified") if ns.ev_all else "") }}
+  {{ ui.stat("Rules", n_rules, "target", hint=(ns.st_pass ~ " of " ~ n_rules ~ " self-tests passed") if n_rules else "Pick behaviours below") }}
+  {{ ui.stat("Approved", ns.approved, "check-circle", "ok" if n_rules and ns.approved == n_rules else "", sub=("of " ~ n_rules) if n_rules else "") }}
+  {{ ui.stat("SIEM queries", ns.q_ok, "database", "warn" if ns.q_ok < ns.q_all else "", sub=("of " ~ ns.q_all) if ns.q_all else "",
+             hint="converted across all rules" if ns.q_all else "") }}
+  {% if r.usage.calls or r.usage.cached_calls %}
+  {{ ui.stat("AI cost", "$" ~ ("%.4f"|format(r.usage.estimated_cost_usd or 0)), "ai",
+             hint=(r.usage.calls ~ " calls · " ~ ((r.usage.input_tokens + r.usage.output_tokens)|tok) ~ " tokens")) }}
+  {% endif %}
+</div>
+
+<div class="run-layout">
+<div class="stack">
+
+  {# ---------------------------------------------------------------- overview #}
+  <section class="card" id="overview" aria-labelledby="ov-title">
+    <div class="card-head"><h2 id="ov-title">{{ ui.icon("file") }}Overview</h2></div>
+    <div class="card-body stack">
+      {% if r.analysis and r.analysis.summary %}<p style="margin:0;font-size:14px;line-height:1.65">{{ r.analysis.summary }}</p>{% endif %}
+      {% if r.warnings %}
+      <div class="alert warn">{{ ui.icon("alert") }}<div style="min-width:0;flex:1"><details class="plain" {{ 'open' if r.warnings|length <= 2 }}>
+        <summary><span class="alert-title" style="color:var(--fg);margin:0">{{ r.warnings|length }} warning(s) from this run</span>{{ ui.icon("chevron-right", "sm chev") }}</summary>
+        <ul>{% for w in r.warnings %}<li style="word-break:break-word">{{ w }}</li>{% endfor %}</ul></details></div></div>
+      {% endif %}
+      <dl class="kv">
+        {% if r.analysis %}
+        <dt>Threat actors</dt><dd>{% if r.analysis.actors %}<span class="chips">{% for a in r.analysis.actors %}<span class="tag">{{ a }}</span>{% endfor %}</span>{% else %}<span class="muted">—</span>{% endif %}</dd>
+        <dt>Malware &amp; tools</dt><dd>{% if r.analysis.malware_tools %}<span class="chips">{% for a in r.analysis.malware_tools %}<span class="tag">{{ a }}</span>{% endfor %}</span>{% else %}<span class="muted">—</span>{% endif %}</dd>
+        {% if r.analysis.victimology %}<dt>Victimology</dt><dd>{{ r.analysis.victimology }}</dd>{% endif %}
+        {% endif %}
+        <dt>Source</dt><dd>{% if r.report.url %}<a href="{{ r.report.url }}" target="_blank" rel="noopener noreferrer">{{ r.report.url }}</a>{% else %}{{ r.report.source }}{% endif %}
+          {% if r.report.authors or r.report.published %}<div class="xs muted">{{ r.report.authors }}{% if r.report.authors and r.report.published %} · {% endif %}{{ r.report.published }}</div>{% endif %}</dd>
+        <dt>SHA-256</dt><dd class="row" style="gap:4px;flex-wrap:nowrap"><code class="truncate">{{ r.report.sha256 }}</code>{{ ui.copy_btn(r.report.sha256, "", "btn ghost icon sm") }}</dd>
+        <dt>Run</dt><dd><code>{{ r.run_id }}</code> <span class="muted">· prompts {{ r.prompt_version }}{% if r.tool_version %} · ti2dac {{ r.tool_version }}{% endif %}</span></dd>
+        {% if r.report.redactions %}<dt>Redacted</dt><dd class="chips">{% for k, n in r.report.redactions.items() %}<span class="tag">{{ k }} × {{ n }}</span>{% endfor %}</dd>{% endif %}
+        {% if r.usage.calls or r.usage.cached_calls %}<dt>AI usage</dt><dd>{{ r.usage.calls }} calls ({{ r.usage.cached_calls }} served from cache, free) ·
+          in {{ "{:,}".format(r.usage.input_tokens) }} / out {{ "{:,}".format(r.usage.output_tokens) }} tokens
+          {% if r.usage.cache_read_tokens %}· cache read {{ "{:,}".format(r.usage.cache_read_tokens) }}{% endif %}
+          · est. ${{ "%.4f"|format(r.usage.estimated_cost_usd or 0) }}{% if r.ai_provider %} · {{ r.ai_provider }}{% endif %}</dd>{% endif %}
+      </dl>
+      {% if r.usage.by_stage %}
+      <details class="plain"><summary>{{ ui.icon("chevron-right", "sm chev") }}AI token usage by stage</summary>
+        <div class="table-wrap" style="margin-top:10px;border:1px solid var(--border);border-radius:var(--radius)"><table class="table compact">
+          <thead><tr><th>Stage</th><th>Model</th><th class="num">Calls</th><th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cache read</th></tr></thead>
+          <tbody>{% for stage, u in r.usage.by_stage.items() %}<tr><td>{{ stage }}</td><td><code>{{ u.model_price_key }}</code></td><td class="num">{{ u.calls }}</td>
+            <td class="num">{{ u.cached_calls }}</td><td class="num">{{ "{:,}".format(u.input_tokens) }}</td><td class="num">{{ "{:,}".format(u.output_tokens) }}</td>
+            <td class="num">{{ "{:,}".format(u.cache_read_tokens) }}</td></tr>{% endfor %}</tbody>
+          <tfoot><tr><td>Total</td><td></td><td class="num">{{ r.usage.calls }}</td><td class="num">{{ r.usage.cached_calls }}</td><td class="num">{{ "{:,}".format(r.usage.input_tokens) }}</td>
+            <td class="num">{{ "{:,}".format(r.usage.output_tokens) }}</td><td class="num">{{ "{:,}".format(r.usage.cache_read_tokens) }}</td></tr></tfoot>
+        </table></div>
+        <p class="xs muted" style="margin-top:8px">Output tokens include the model's thinking. Analyse = 1 call per report; generate = 1 per rule;
+          repair/translate only when needed. Cached calls cost nothing.</p>
+      </details>
+      {% endif %}
+    </div>
+  </section>
+
+  {# ---------------------------------------------------------------- behaviours #}
+  <section class="card" id="behaviours" aria-labelledby="bh-title">
+    <div class="card-head">
+      <div><h2 id="bh-title">{{ ui.icon("list") }}Behaviours <span class="badge muted">{{ r.behaviours|length }}</span></h2>
+        <p class="desc">TTPs extracted from the report, ranked by how detectable, reproducible and low-noise they are.
+          {% if ai_enabled %}Tick behaviours without a rule to generate more.{% else %}AI is off, so no new rules can be generated here.{% endif %}</p></div>
+    </div>
+    <form id="generate-form" method="post" action="/runs/{{ r.run_id }}/generate" data-busy>
+      <input type="hidden" name="select" value="">
+      <div class="card-body flush"><div class="table-wrap"><table class="table">
+        <thead><tr>{% if ai_enabled %}<th class="shrink"><span class="sr-only">Select</span></th>{% endif %}<th class="shrink">ID</th><th>Behaviour</th><th>ATT&amp;CK</th><th>Rank</th><th class="shrink">Rule</th></tr></thead>
+        <tbody>
+        {% for b in r.behaviours %}
+        {%- set pkg = (r.packages|selectattr("behaviour.id", "equalto", b.id)|list|first) -%}
+        {%- set v = b.evidence_verified|select|list|length -%}
+        <tr class="{{ 'has-rule' if pkg }}">
+          {% if ai_enabled %}<td class="shrink">{% if not pkg %}<input type="checkbox" name="pick" value="{{ b.id }}" aria-label="Select {{ b.id }} {{ b.name }}">{% endif %}</td>{% endif %}
+          <td class="shrink"><span class="badge sq muted mono">{{ b.id }}</span></td>
+          <td style="min-width:280px">
+            <div class="cell-title">{{ b.name }}</div>
+            <div class="cell-sub" style="font-size:12.5px">{{ b.description }}</div>
+            {% if b.evidence %}
+            <details class="plain evidence"><summary>{{ ui.icon("chevron-right", "sm chev") }}Evidence
+              <span class="badge {{ 'ok' if v == b.evidence|length else 'bad' if v == 0 else 'warn' }}" style="height:19px;font-size:11px">{{ v }}/{{ b.evidence|length }} verified</span></summary>
+              <ul>{% for q in b.evidence %}<li>{% if b.evidence_verified[loop.index0] %}<span class="ok" title="found verbatim in the report">{{ ui.icon("check", "sm") }}</span>{% else %}<span class="bad" title="not found verbatim in the report">{{ ui.icon("x", "sm") }}</span>{% endif %}<q>{{ q }}</q></li>{% endfor %}</ul>
+            </details>{% endif %}
+          </td>
+          <td style="min-width:180px">
+            <a class="badge sq primary" href="https://attack.mitre.org/techniques/{{ b.technique_id|replace('.', '/') }}/" rel="noopener" target="_blank">{{ b.technique_id }}{{ ui.icon("external", "sm") }}</a>
+            {% if not b.attack_valid %}<span class="badge sq bad" title="{{ b.attack_note }}">ATT&amp;CK?</span>{% elif b.attack_note %}<span class="badge sq warn" title="{{ b.attack_note }}">note</span>{% endif %}
+            <div class="cell-sub" style="margin-top:5px">{{ b.technique_name }}</div>
+            <div class="cell-sub">{{ b.tactic }}</div>
+          </td>
+          <td><div class="rank"><span class="mono">{{ b.rank_score }}</span>
+            <span class="meter"><i style="width:{{ ((b.rank_score / max_rank * 100) if max_rank else 0)|round|int }}%"></i></span></div></td>
+          <td class="shrink">{% if pkg %}<a class="badge ok" href="#{{ pkg.slug }}">{{ ui.icon("target", "sm") }}{{ pkg.slug }}</a>{% else %}<span class="muted">—</span>{% endif %}</td>
+        </tr>{% endfor %}
+        </tbody>
+      </table></div></div>
+      {% if ai_enabled %}
+      <div class="selbar" role="region" aria-label="Selection">
+        <span><b data-sel-count>0 behaviours</b> selected <span class="xs" style="opacity:.7" data-sel-list></span></span>
+        <span class="spacer"></span>
+        <button type="button" class="btn ghost sm" data-sel-clear style="color:inherit">Clear</button>
+        <button type="submit" class="btn sm"><span class="spin"></span><span class="ico-default">{{ ui.icon("zap", "sm") }}</span>Generate rules for selected behaviours</button>
+      </div>{% endif %}
+    </form>
+  </section>
+
+  {# ---------------------------------------------------------------- rules #}
+  {% if not r.packages %}
+  <section class="card">{{ ui.empty("No rules yet", "Select behaviours above and generate rules for them." if ai_enabled else "Enable the AI to generate rules from these behaviours.", "target") }}</section>
+  {% endif %}
+
+  {% for p in r.packages %}
+  {%- set fbs = feedback|selectattr("slug", "equalto", p.slug)|list -%}
+  {%- set open_fb = fbs|selectattr("status", "equalto", "open")|list|length -%}
+  {%- set trs = results|selectattr("slug", "equalto", p.slug)|list -%}
+  {%- set q_ok = p.queries|selectattr("query")|list|length -%}
+  {%- set ls = p.draft.sigma.logsource -%}
+  <section class="card rule" id="{{ p.slug }}" aria-labelledby="t-{{ p.slug }}">
+    <div class="rule-head">
+      <div style="min-width:0;flex:1 1 380px">
+        <span class="slug">{{ ui.icon("target", "sm") }}{{ p.slug }} · v{{ p.version }}</span>
+        <h2 id="t-{{ p.slug }}">{{ p.draft.sigma.title }}</h2>
+        <div class="chips">
+          <a class="badge sq primary" href="https://attack.mitre.org/techniques/{{ p.behaviour.technique_id|replace('.', '/') }}/" target="_blank" rel="noopener">{{ p.behaviour.technique_id }}{{ ui.icon("external", "sm") }}</a>
+          <span class="badge sq"><span class="k">from</span>{{ p.behaviour.id }}</span>
+          <span class="badge sq {{ ui.tone(p.draft.sigma.level) }}"><span class="k">level</span>{{ p.draft.sigma.level }}{% if p.draft.sigma.correlation %} · threshold{% endif %}</span>
+          <span class="badge sq"><span class="k">logsource</span>{{ ls.product }}/{{ ls.category or ls.service }}</span>
+          {% if p.repair_attempts %}<span class="badge sq info" title="The validator found problems and the AI fixed them">{{ p.repair_attempts }} auto-repair(s)</span>{% endif %}
+          {% if p.created_by %}<span class="badge sq muted">{{ ui.icon("user", "sm") }}author {{ p.created_by }}</span>{% endif %}
+        </div>
+      </div>
+      <div class="status-stack">
+        {{ ui.status(p.sigma_status, label="sigma") }}
+        <span title="rule evaluated against its simulation's expected events and benign look-alikes">{{ ui.status(p.selftest, label="self-test") }}</span>
+        {{ ui.status(p.review_status, label="review") }}
+      </div>
+    </div>
+
+    {% if p.selftest == "fail" or p.sim_blocked %}
+    <div class="issues"><div class="alert bad">{{ ui.icon("x") }}<div><div class="alert-title">Needs attention before deployment</div><ul>
+      {% if p.selftest == "fail" %}{% for d in p.selftest_details %}<li>self-test: {{ d }}</li>{% endfor %}{% endif %}
+      {% if p.sim_blocked %}<li>simulation blocked by safety linter</li>{% endif %}
+    </ul></div></div></div>{% endif %}
+    {% if p.quality_warnings %}
+    <div class="issues"><div class="alert warn">{{ ui.icon("alert") }}<div><div class="alert-title">Quality warnings</div><ul>
+      {% for w in p.quality_warnings %}<li>{{ w }}</li>{% endfor %}</ul></div></div></div>{% endif %}
+    {% if p.similar_rules %}
+    <div class="issues"><div class="alert info">{{ ui.icon("duplicate") }}<div style="min-width:0">
+      <details class="plain"><summary><span class="alert-title" style="color:var(--fg);margin:0">Possible duplicate of {{ p.similar_rules|length }} existing rule(s)</span>{{ ui.icon("chevron-right", "sm chev") }}</summary>
+      <ul>{% for s in p.similar_rules %}<li style="word-break:break-word">{{ s }}</li>{% endfor %}</ul></details></div></div></div>{% endif %}
+
+    {% if notice and notice.slug == p.slug %}
+    <div class="issues" role="status">
+    {% if notice.status == "applied" %}<div class="alert ok">{{ ui.icon("check-circle") }}<div><div class="alert-title">Feedback #{{ notice.id }} applied: {{ notice.resolution }}</div>
+      The new version is a draft. Someone other than you has to review and approve it.{% if notice.comment %} Your comment is now a lesson for future rules.{% endif %}</div></div>
+    {% elif (notice.resolution or "").startswith("correction rejected") %}<div class="alert bad">{{ ui.icon("x") }}<div style="min-width:0"><div class="alert-title">Your corrected rule was not applied</div>
+      <div style="word-break:break-word">{{ notice.resolution }}</div>
+      <div class="xs muted" style="margin-top:4px">Feedback #{{ notice.id }} is saved and still open. Fix the YAML and submit again, or close it in the Feedback tab.</div></div></div>
+    {% else %}<div class="alert info">{{ ui.icon("feedback") }}<div><div class="alert-title">Feedback #{{ notice.id }} saved</div>
+      It stays open until someone fixes it{% if ai_enabled and notice.artifact in ('sigma_rule','query','telemetry','attack_mapping') %} (for example with "Fix with AI" in the Feedback tab){% endif %} or closes it.</div></div>{% endif %}
+    </div>{% endif %}
+
+    <div data-tabs="rule:{{ r.run_id }}:{{ p.slug }}" {% if notice and notice.slug == p.slug %}data-open="feedback"{% endif %}>
+      <div class="tabs" role="tablist" aria-label="{{ p.slug }} sections">
+        <button type="button" role="tab" data-tab="sigma" aria-selected="true">{{ ui.icon("file", "sm") }}Sigma rule</button>
+        <button type="button" role="tab" data-tab="queries">{{ ui.icon("database", "sm") }}SIEM queries <span class="count {{ 'warn' if q_ok < p.queries|length }}">{{ q_ok }}/{{ p.queries|length }}</span></button>
+        {% if p.field_mappings %}<button type="button" role="tab" data-tab="mapping">{{ ui.icon("layers", "sm") }}Field mapping</button>{% endif %}
+        <button type="button" role="tab" data-tab="simulation">{{ ui.icon("play", "sm") }}Simulation</button>
+        <button type="button" role="tab" data-tab="ads">{{ ui.icon("book", "sm") }}Triage (ADS)</button>
+        <button type="button" role="tab" data-tab="feedback">{{ ui.icon("feedback", "sm") }}Feedback{% if fbs %} <span class="count {{ 'warn' if open_fb }}">{{ fbs|length }}</span>{% endif %}</button>
+        <button type="button" role="tab" data-tab="tests">{{ ui.icon("flask", "sm") }}Tests{% if trs %} <span class="count">{{ trs|length }}</span>{% endif %}</button>
+      </div>
+
+      <div role="tabpanel" data-panel="sigma" class="active">
+        <div class="code">
+          <div class="code-bar"><span class="title mono truncate">{{ rule_filename(p) }}</span><span class="spacer"></span>
+            <a class="btn ghost sm" href="/runs/{{ r.run_id }}/files/rules/{{ rule_filename(p) }}" target="_blank" rel="noopener">{{ ui.icon("external", "sm") }}Raw</a>
+            {{ ui.copy_btn() }}</div>
+          <pre>{{ p.rule_yaml }}</pre>
+        </div>
+        {% if p.sigma_issues %}<div class="alert warn" style="margin-top:12px">{{ ui.icon("alert") }}<div><div class="alert-title">Validator notes</div>
+          <ul>{% for i in p.sigma_issues %}<li><code>{{ i }}</code></li>{% endfor %}</ul></div></div>{% endif %}
+        {% if p.history %}<p class="xs muted" style="margin:12px 0 0">{{ ui.icon("history", "sm") }} Previous versions:
+          {% for h in p.history %}v{{ h.version }} ({{ h.replaced_at }}: {{ h.reason }}){% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+      </div>
+
+      <div role="tabpanel" data-panel="queries">
+        <div class="split" data-tabs="">
+          <div class="picker" role="tablist" aria-label="SIEM targets">
+            {% for q in p.queries %}{% set st = status[p.slug][q.target] %}
+            <button type="button" role="tab" data-tab="{{ q.target }}" aria-selected="{{ 'true' if loop.first else 'false' }}" title="{{ q.label }}">
+              <span class="dot {{ 'bad' if not q.query else ui.tone(st) if st != 'not-tested' else 'primary' }}"></span><span class="t">{{ q.label }}</span></button>
+            {% endfor %}
+            <div class="xs muted row" style="gap:10px;padding:10px 9px 2px"><span class="row" style="gap:4px"><span class="dot primary"></span>converted</span>
+              <span class="row" style="gap:4px"><span class="dot ok"></span>tested</span><span class="row" style="gap:4px"><span class="dot bad"></span>failed</span></div>
+          </div>
+          <div>
+          {% for q in p.queries %}{% set st = status[p.slug][q.target] %}
+            <div class="qpanel {{ 'active' if loop.first }}" role="tabpanel" data-panel="{{ q.target }}" style="padding:0">
+              <div class="code">
+                <div class="code-bar"><span class="title">{{ q.label }}</span>
+                  {{ ui.status(st) }}
+                  {% if q.method and q.method != "pysigma" %}<span class="badge sq warn" title="Translated by the model; no deterministic backend">AI-translated (unverified)</span>{% endif %}
+                  <span class="spacer"></span>{% if q.query %}{{ ui.copy_btn() }}{% endif %}</div>
+                {% if q.query %}<pre>{{ q.query }}</pre>
+                {% else %}<div class="alert bad">{{ ui.icon("x") }}<div><div class="alert-title">Conversion failed</div><code style="background:none;padding:0">{{ q.error }}</code></div></div>{% endif %}
+              </div>
+              {% if q.notes %}<p class="xs muted" style="margin:10px 0 0">{{ q.notes }}</p>{% endif %}
+            </div>
+          {% endfor %}
+          </div>
+        </div>
+      </div>
+
+      {% if p.field_mappings %}
+      <div role="tabpanel" data-panel="mapping" style="padding:12px 0 8px">
+        {% set tids = p.queries|selectattr("method", "equalto", "pysigma")|map(attribute="target")|list %}
+        <p class="xs muted" style="padding:0 20px">How each Sigma field is named in each SIEM. <span class="bad">Red</span> cells are not supported by that backend.</p>
+        <div class="table-wrap"><table class="table compact">
+          <thead><tr><th>Sigma field</th>{% for t in tids %}<th>{{ t }}</th>{% endfor %}</tr></thead>
+          <tbody>{% for fm in p.field_mappings %}<tr><td><code>{{ fm.sigma_field }}</code></td>
+            {% for t in tids %}{% set v = fm.targets.get(t, "") %}
+              {% if v.startswith('UNSUPPORTED') %}<td class="bad" title="{{ v }}">unsupported</td>{% else %}<td class="mono" style="font-size:12px">{{ v }}</td>{% endif %}
+            {% endfor %}</tr>{% endfor %}</tbody>
+        </table></div>
+      </div>{% endif %}
+
+      <div role="tabpanel" data-panel="simulation">
+        <div class="alert info" style="margin-bottom:14px">{{ ui.icon("shield") }}<div class="xs">Run only in an isolated lab. ti2dac generates and lints these scripts; it never executes them.</div></div>
+        {% if sim_readme.get(p.slug) %}<div class="md" style="margin-bottom:16px">{{ sim_readme.get(p.slug, "")|md }}</div>{% endif %}
+        <div class="grid grid-2">
+          {{ ui.code(p.draft.simulation.simulate if not p.sim_blocked else "(blocked — see linter findings above)", "simulate", not p.sim_blocked) }}
+          {{ ui.code(p.draft.simulation.cleanup if not p.sim_blocked else "(blocked)", "cleanup", not p.sim_blocked) }}
+        </div>
+      </div>
+
+      <div role="tabpanel" data-panel="ads">
+        {% if ads.get(p.slug) %}<div class="md">{{ ads.get(p.slug, "")|md }}</div>
+        {% else %}{{ ui.empty("No triage guide", "The Alerting & Detection Strategy document was not generated for this rule.", "book") }}{% endif %}
+      </div>
+
+      <div role="tabpanel" data-panel="feedback">
+        <div class="grid" style="grid-template-columns:minmax(0,1fr)">
+          <form method="post" action="/runs/{{ r.run_id }}/rules/{{ p.slug }}/feedback" class="stack" style="gap:14px">
+            <div><h3>Report a mistake or give feedback</h3>
+              <p class="xs muted" style="margin:4px 0 0">Saved against v{{ p.version }}. Paste a corrected rule to create v{{ p.version + 1 }} now, or leave it open and fix it
+                later{% if ai_enabled %} (by hand or with AI){% endif %}. When a fix is applied, your comment becomes a lesson for future rules with the same technique or log source.
+                <a href="/feedback#how">How feedback works</a></p></div>
+            <div class="form-grid">
+              <label class="field"><span>Artifact</span><select class="select" name="artifact">{% for a in artifacts %}<option value="{{ a }}">{{ a.replace('_', ' ') }}</option>{% endfor %}</select></label>
+              <label class="field"><span>Category</span><select class="select" name="category">{% for k, v in categories.items() %}<option value="{{ k }}">{{ v }}</option>{% endfor %}</select></label>
+              <label class="field"><span>Severity</span><select class="select" name="severity">{% for s in severities %}<option {{ 'selected' if s=='medium' }}>{{ s }}</option>{% endfor %}</select></label>
+              <label class="field"><span>SIEM target <span class="help">(query feedback)</span></span><select class="select" name="target"><option value="">—</option>{% for q in p.queries %}<option value="{{ q.target }}">{{ q.target }}</option>{% endfor %}</select></label>
+            </div>
+            <label class="field"><span>What is wrong and why</span><textarea class="textarea prose" name="comment" required placeholder="e.g. the rule keys on a filename that changes per intrusion; key on the parent process instead"></textarea></label>
+            <details class="plain"><summary>{{ ui.icon("chevron-right", "sm chev") }}Paste a corrected Sigma rule (optional, becomes v{{ p.version + 1 }} after validation)</summary>
+              <textarea class="textarea" name="correction" placeholder="paste full corrected YAML" style="margin-top:8px;min-height:160px"></textarea></details>
+            <div><button type="submit" class="btn">{{ ui.icon("feedback", "sm") }}Submit feedback</button></div>
+          </form>
+
+          {% if fbs %}<div style="border:1px solid var(--border);border-radius:var(--radius);overflow:hidden"><div class="table-wrap"><table class="table">
+            <thead><tr><th class="shrink">#</th><th>Status</th><th>Feedback</th><th class="shrink">Actions</th></tr></thead>
+            <tbody>{% for f in fbs %}<tr>
+              <td class="muted">{{ f.id }}</td>
+              <td class="shrink">{{ ui.status(f.status) }}</td>
+              <td><div class="row" style="gap:6px"><span class="badge sq {{ ui.tone(f.severity) }}">{{ f.severity }}</span><span class="xs muted">{{ f.artifact }} / {{ categories.get(f.category, f.category) }}{% if f.target %} · {{ f.target }}{% endif %}</span></div>
+                <div style="margin-top:4px">{{ f.comment }}</div>
+                {% if f.resolution %}<div class="cell-sub">{{ ui.icon("check", "sm") }} {{ f.resolution }}</div>{% endif %}
+                <div class="cell-sub">{{ f.reviewer }} · {{ ui.short_date(f.created_at) }}</div></td>
+              <td class="shrink">{% if f.status == 'open' %}<div class="stack-sm">
+                {% if ai_enabled and f.artifact in ('sigma_rule','query','telemetry','attack_mapping') %}
+                <form method="post" action="/feedback/{{ f.id }}/apply" data-busy><button type="submit" class="btn subtle sm"><span class="spin"></span><span class="ico-default">{{ ui.icon("ai", "sm") }}</span>Fix with AI → v{{ p.version + 1 }}</button></form>{% endif %}
+                <form method="post" action="/feedback/{{ f.id }}/resolve" class="stack-sm" style="gap:4px">
+                  <div class="row" style="gap:4px;flex-wrap:nowrap">
+                  <select class="select sm" name="status" aria-label="Close as" style="width:auto"><option>rejected</option><option>wontfix</option><option value="applied">fixed elsewhere</option></select>
+                  <input class="input sm" name="note" placeholder="note" style="width:110px"><button class="btn outline sm">Close</button></div>
+                  <label class="row xs muted" style="gap:6px" title="Only for 'fixed elsewhere': inject this comment into future prompts for the same technique / log source"><input type="checkbox" name="lesson" value="1">save as lesson</label></form>
+              </div>{% endif %}</td>
+            </tr>{% endfor %}</tbody>
+          </table></div></div>{% endif %}
+        </div>
+      </div>
+
+      <div role="tabpanel" data-panel="tests">
+        <form method="post" action="/runs/{{ r.run_id }}/rules/{{ p.slug }}/test" class="stack" style="gap:14px">
+          <div><h3>Record test result / alert disposition</h3>
+            <p class="xs muted" style="margin:4px 0 0">Lab runs of the simulation, negative tests on normal activity, or production alert outcomes.</p></div>
+          <div class="form-grid">
+            <label class="field"><span>Target</span><select class="select" name="target">{% for q in p.queries if q.query %}<option>{{ q.target }}</option>{% endfor %}<option>all</option></select></label>
+            <label class="field" style="grid-column:span 2"><span>Result</span><select class="select" name="result">{% for k, v in test_results.items() %}<option value="{{ k }}">{{ v }}</option>{% endfor %}</select></label>
+            <label class="field"><span>FP count</span><input class="input" type="number" name="fp_count" value="0" min="0"></label>
+          </div>
+          <div class="form-grid">
+            <label class="field"><span>Evidence</span><input class="input" name="evidence" placeholder="event ID, screenshot path, cause"></label>
+            <label class="field"><span>Environment</span><input class="input" name="environment" placeholder="lab-win11 + Splunk 9.3"></label>
+          </div>
+          <div><button type="submit" class="btn">{{ ui.icon("flask", "sm") }}Record result</button></div>
+        </form>
+        {% if trs %}<div style="border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;margin-top:18px"><div class="table-wrap"><table class="table compact">
+          <thead><tr><th>When</th><th>Ver</th><th>Target</th><th>Result</th><th class="num">FP</th><th>Evidence</th><th>By</th></tr></thead>
+          <tbody>{% for t in trs %}<tr><td class="muted nowrap">{{ ui.short_date(t.created_at) }}</td><td>v{{ t.rule_version }}</td><td>{{ t.target }}</td>
+            <td>{{ ui.status(t.result) }}</td><td class="num">{{ t.fp_count }}</td><td>{{ t.evidence }}{% if t.environment %}<div class="cell-sub">{{ t.environment }}</div>{% endif %}</td><td>{{ t.tester }}</td></tr>{% endfor %}</tbody>
+        </table></div></div>{% endif %}
+      </div>
+    </div>
+
+    <form method="post" action="/runs/{{ r.run_id }}/rules/{{ p.slug }}/review" class="card-foot review-bar">
+      <span class="field-label">Review</span>
+      <div class="segmented" role="radiogroup" aria-label="Review status">
+        {% for s in review_states %}<label><input type="radio" name="status" value="{{ s }}" {{ 'checked' if s == p.review_status }}><span class="dot {{ ui.tone(s) }}"></span>{{ s }}</label>{% endfor %}
+      </div>
+      <input class="input sm note" name="note" placeholder="Review note (optional)" aria-label="Review note">
+      <button class="btn sm">Save review</button>
+      <span class="xs muted" style="flex-basis:100%">Approving needs the approver role and must be done by someone other than the rule's author.</span>
+    </form>
+  </section>
+  {% endfor %}
+</div>
+
+<aside class="rail" aria-label="On this page">
+  <div class="section-title">On this page</div>
+  <a href="#overview">{{ ui.icon("file", "sm") }}<span class="t">Overview</span></a>
+  <a href="#behaviours">{{ ui.icon("list", "sm") }}<span class="t">Behaviours</span></a>
+  {% if r.packages %}<div class="group"><div class="section-title">Rules</div>
+  {% for p in r.packages %}<a href="#{{ p.slug }}" title="{{ p.draft.sigma.title }}"><span class="dot {{ ui.tone(p.review_status) }}"></span><span class="t">{{ p.draft.sigma.title }}</span></a>{% endfor %}
+  </div>{% endif %}
+</aside>
+</div>
+{% endblock %}

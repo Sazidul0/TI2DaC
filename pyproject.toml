@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ti2dac"
+version = "0.1.0"
+description = "Threat Intelligence to Detection-as-Code: TI report -> Sigma -> multi-SIEM queries + safe simulation guides"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=2.3",
+    "pydantic>=2.7",
+    "pysigma>=0.11,<0.12",
+    "pyparsing>=3.1,<3.2",          # pySigma 0.11 condition parser breaks on pyparsing 3.2+
+    "sigma-cli>=1.0",
+    "pySigma-backend-splunk",
+    "pySigma-backend-elasticsearch",
+    "pySigma-backend-kusto",
+    "pySigma-backend-crowdstrike",
+    "pySigma-backend-qradar-aql",
+    "pySigma-backend-opensearch",
+    "pySigma-backend-loki",
+    "pySigma-pipeline-sysmon",
+    "pySigma-pipeline-windows",
+    "pySigma-backend-sqlite==0.2.0",  # local rule evaluation (self-tests, replay); later versions need pySigma 2
+    "trafilatura>=1.8",
+    "beautifulsoup4",
+    "lxml",
+    "pypdf>=4",
+    "python-docx>=1.1",               # incident reports in Word format
+    "pyyaml>=6",
+    "httpx>=0.27",
+    "typer>=0.12",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "jinja2>=3.1",
+    "markdown-it-py>=3",
+    "python-multipart",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+gemini = ["google-genai>=1.30"]
+evtx = ["python-evtx>=0.7", "defusedxml>=0.7"]
+
+[project.scripts]
+ti2dac = "ti2dac.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ti2dac = ["data/*.json", "data/*.yaml", "data/*.yml", "web/templates/*.html", "web/static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::SyntaxWarning", "ignore::DeprecationWarning"]
