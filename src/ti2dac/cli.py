@@ -22,8 +22,10 @@ app = typer.Typer(add_completion=False, no_args_is_help=True,
                   help="Threat Intelligence -> Sigma -> multi-SIEM queries + safe simulation guides.")
 fb_app = typer.Typer(no_args_is_help=True, help="Reviewer feedback on generated artifacts.")
 test_app = typer.Typer(no_args_is_help=True, help="Record lab test results / alert dispositions.")
+client_app = typer.Typer(no_args_is_help=True, help="Client profiles: per-client SIEM field names and pipelines.")
 app.add_typer(fb_app, name="feedback")
 app.add_typer(test_app, name="test")
+app.add_typer(client_app, name="client")
 
 _state: dict = {}
 
@@ -69,6 +71,18 @@ def _actor() -> str:
     return getpass.getuser()
 
 
+def _use_clients(s: Settings, names: list[str]) -> None:
+    """--client overrides the configured client list; profiles are validated before any work starts."""
+    from . import clients
+
+    if names:
+        s.clients = names
+    try:
+        clients.active(s)
+    except clients.ClientError as e:
+        _fail(str(e))
+
+
 def _llm(record) -> LLM | None:
     return LLM(S(), record.usage, tlp=record.report.tlp_effective) if S().ai.enabled else None
 
@@ -107,6 +121,8 @@ def run(source: str = typer.Argument(..., help="Report file (HTML/PDF/MD/TXT) or
         events: Optional[Path] = typer.Option(None, "--events", "-e",
                                               help="Incident evidence logs (.evtx/.json/.jsonl) to replay against every "
                                                    "generated rule. Stays local; never sent to the AI"),
+        client: list[str] = typer.Option([], "--client", "-C", help="Also produce queries for this client profile "
+                                                                     "(repeat for several; '*' = all). Default: config `clients`"),
         out: Optional[Path] = typer.Option(None, "--out", "-o", help="Output directory (default output/<run-id>)")):
     """Full pipeline: ingest -> analyze -> generate -> validate -> convert -> render package.
 
@@ -117,6 +133,7 @@ def run(source: str = typer.Argument(..., help="Report file (HTML/PDF/MD/TXT) or
     from .replay import ReplayError, load_events
 
     s = S()
+    _use_clients(s, client)
     if no_ai:
         s.ai.enabled = False
     store = _store()
@@ -186,11 +203,13 @@ def analyze(source: str, no_ai: bool = typer.Option(False, "--no-ai"),
 
 
 @app.command()
-def generate(run_id: str, select: str = typer.Option(..., "--select", "-s", help="Behaviour IDs, e.g. B1,B3")):
+def generate(run_id: str, select: str = typer.Option(..., "--select", "-s", help="Behaviour IDs, e.g. B1,B3"),
+             client: list[str] = typer.Option([], "--client", "-C", help="Client profile(s) to produce queries for")):
     """Stage 2 for chosen behaviours of an analysed run (adds rules; existing ones are kept)."""
     from .pipeline import generate as gen
 
     s = S()
+    _use_clients(s, client)
     if not s.ai.enabled:
         _fail("generation needs AI; write rules by hand and use `ti2dac convert`")
     from .pipeline import check_tlp_for_run
@@ -218,12 +237,114 @@ def generate(run_id: str, select: str = typer.Option(..., "--select", "-s", help
     _print_usage(record)
 
 
+# --------------------------------------------------------------------------- multi-event chains
+@app.command()
+def chain(run_id: str, rules: list[str] = typer.Argument(..., help="2-4 rule slugs in order, e.g. rule-001 rule-003"),
+          within: str = typer.Option(..., "--within", "-w", help="Time window, e.g. 10m, 1h"),
+          on: str = typer.Option("host", "--on", help="What the steps share: host, user or source_ip"),
+          name: str = typer.Option("", "--name", help="Chain name (default: the step titles)"),
+          unordered: bool = typer.Option(False, "--unordered", help="Steps may happen in any order")):
+    """Join existing rules into a multi-event detection. Built by code (Sigma correlation + query templates), no AI."""
+    from .pipeline import add_chain
+
+    path = _run_dir(run_id)
+    record = load_record(path)
+    titles = {p.slug: p.draft.sigma.title for p in record.packages}
+    try:
+        add_chain(record, S(), rules, name=name or " then ".join(titles.get(r, r) for r in rules), within=within,
+                  join_on=on, ordered=not unordered)
+    except ValueError as e:
+        _fail(str(e))
+    _store().audit(_actor(), "chain.add", {"run_id": run_id, "steps": rules, "within": within, "on": on})
+    _rerender(record, path)
+    c = record.chains[-1]
+    typer.echo(f"{c.slug}: {c.name}")
+    for q in c.queries:
+        typer.echo(f"  {q.client + '/' if q.client else ''}{q.target:24} {'ok' if q.query else 'n/a: ' + (q.error or '')[:110]}")
+    for w in c.warnings:
+        typer.secho(f"  ! {w}", fg=typer.colors.YELLOW, err=True)
+
+
+# --------------------------------------------------------------------------- client profiles
+@client_app.command("list")
+def client_list():
+    """Client profiles in clients_dir and what each maps."""
+    from . import clients
+
+    try:
+        profiles = clients.load_all(S().clients_dir)
+    except clients.ClientError as e:
+        _fail(str(e))
+    if not profiles:
+        typer.echo(f"no profiles in {S().clients_dir}/ (create one with `ti2dac client init <name>`)")
+    active = set(S().clients)
+    for p in profiles.values():
+        mark = "*" if p.name in active or "*" in active else " "
+        typer.echo(f"{mark} {p.name:16} targets={','.join(p.targets) or '(default)'} "
+                   f"mapped={sum(len(v) for v in p.fields.values())} pipelines={sum(len(v) for v in p.pipelines.values())}"
+                   f"  {p.description}")
+
+
+@client_app.command("init")
+def client_init(name: str, targets: str = typer.Option("", "--targets", "-t", help="Comma list (default: configured targets)"),
+                rules: Optional[Path] = typer.Option(None, "--rules", help="Folder of Sigma rules whose fields to list")):
+    """Write a starter profile listing the Sigma fields your rules use, ready to fill in with the client's names."""
+    from . import clients
+
+    d = Path(S().clients_dir)
+    path = d / f"{name}.yaml"
+    if path.exists():
+        _fail(f"{path} already exists")
+    tids = [t for t in targets.split(",") if t] or S().targets
+    unknown = [t for t in tids if t not in TARGETS]
+    if unknown:
+        _fail(f"unknown target(s): {', '.join(unknown)}")
+    texts = [p.read_text() for p in sorted((rules or Path(S().output_dir)).rglob("*.yml"))]
+    fields = sorted({f for text in texts for f in st.rule_fields(text) if f})
+    d.mkdir(parents=True, exist_ok=True)
+    path.write_text(clients.starter(name, tids, fields))
+    typer.echo(f"wrote {path} ({len(fields)} Sigma fields listed). Fill in the client's names, then "
+               f"`ti2dac client check {name}`.")
+
+
+@client_app.command("check")
+def client_check(name: str, rule: Optional[Path] = typer.Option(None, "--rule", help="Show this rule's queries for the client")):
+    """Validate a profile and show how it maps fields (and, with --rule, the client's queries)."""
+    from . import clients
+
+    try:
+        prof = clients.load_all(S().clients_dir).get(name)
+    except clients.ClientError as e:
+        _fail(str(e))
+    if prof is None:
+        _fail(f"no client profile {name!r} in {S().clients_dir}/")
+    typer.echo(f"{prof.name}: profile OK ({prof.path})")
+    for t, m in prof.fields.items():
+        typer.echo(f"  {t}: " + ", ".join(f"{a} -> {b}" for a, b in m.items()))
+    if rule:
+        text = rule.read_text()
+        for q in st.convert(text, prof.targets or S().targets, prof.index_overrides, prof):
+            typer.echo(f"\n## {q.label}\n{q.query or 'ERROR: ' + str(q.error)}")
+
+
 # --------------------------------------------------------------------------- deterministic tools
 @app.command()
 def convert(rules: list[Path], targets: str = typer.Option("", "--targets", "-t", help="Comma list; default from config"),
+            client: str = typer.Option("", "--client", help="Use this client profile's field names, pipelines and indexes"),
             out: Optional[Path] = typer.Option(None, "--out", "-o")):
     """Convert existing Sigma rule files to all configured SIEMs (no AI)."""
-    tids = [t for t in targets.split(",") if t] or S().targets
+    from . import clients
+
+    prof = None
+    if client:
+        try:
+            prof = clients.load_all(S().clients_dir).get(client)
+        except clients.ClientError as e:
+            _fail(str(e))
+        if prof is None:
+            _fail(f"no client profile {client!r} in {S().clients_dir}/ (see `ti2dac client list`)")
+    tids = [t for t in targets.split(",") if t] or (prof.targets if prof and prof.targets else S().targets)
+    overrides = prof.index_overrides if prof else S().index_overrides
     for rule in rules:
         text = rule.read_text()
         ok, issues = st.validate_rule(text)
@@ -232,7 +353,7 @@ def convert(rules: list[Path], targets: str = typer.Option("", "--targets", "-t"
             typer.echo(f"  {i}")
         if not ok:
             continue
-        for q in st.convert(text, tids, S().index_overrides):
+        for q in st.convert(text, tids, overrides, prof):
             if out:
                 d = out / rule.stem
                 d.mkdir(parents=True, exist_ok=True)
@@ -290,7 +411,7 @@ def rerender(run_id: str, recheck: bool = typer.Option(
         False, "--recheck", help="Also re-run validation, conversion, field mapping, self-tests and the safety lint "
                                  "with the current ti2dac version (no AI calls, no tokens)")):
     """Re-render a run's package (after tests/feedback, or after upgrading ti2dac). No AI."""
-    from .pipeline import finalize_package
+    from .pipeline import finalize_package, rebuild_chains
 
     path = _run_dir(run_id)
     record = load_record(path)
@@ -298,10 +419,11 @@ def rerender(run_id: str, recheck: bool = typer.Option(
         for p in record.packages:
             ai_queries = [q for q in p.queries if q.method == "llm"]     # keep earlier AI translations
             finalize_package(p, record, S(), None, allow_repair=False)
-            have = {q.target for q in p.queries}
-            p.queries += [q for q in ai_queries if q.target not in have]
+            have = {(q.client, q.target) for q in p.queries}
+            p.queries += [q for q in ai_queries if (q.client, q.target) not in have]
             typer.echo(f"  {p.slug}: sigma={p.sigma_status} self-test={p.selftest} "
                        f"queries={sum(1 for q in p.queries if q.query)}/{len(p.queries)} sim={'BLOCKED' if p.sim_blocked else 'ok'}")
+        rebuild_chains(record, S())
     _rerender(record, path)
     typer.echo(f"re-rendered {path}")
 

@@ -111,7 +111,7 @@ class Settings:
     targets: list[str] = field(default_factory=lambda: [
         "splunk", "splunk_cim", "elastic_lucene", "elastic_esql", "elastic_eql",
         "sentinel_asim", "sentinel_securityevent", "defender_xdr", "crowdstrike_cql",
-        "qradar_aql", "opensearch", "loki",
+        "qradar_aql", "opensearch", "loki", "wazuh_rule", "wazuh_indexer",
     ])
     # SIEMs without a pySigma backend; translated by the model and flagged as unverified.
     llm_targets: list[str] = field(default_factory=list)
@@ -123,6 +123,9 @@ class Settings:
     telemetry: list[str] = field(default_factory=list)
     # Environment-specific query scoping, e.g. {splunk: "index=wineventlog", elastic_esql: "logs-endpoint.events.*"}
     index_overrides: dict[str, str] = field(default_factory=dict)
+    # Client profiles (clients.py): each run also produces queries in these clients' own SIEM schemas.
+    clients: list[str] = field(default_factory=list)     # profile names, or ["*"] for every profile
+    clients_dir: str = "clients"
     # Folders of existing (internal) Sigma rules to check generated rules against for duplicates.
     rule_repos: list[str] = field(default_factory=list)
     ai: AIConfig = field(default_factory=AIConfig)

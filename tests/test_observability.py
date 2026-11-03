@@ -48,6 +48,17 @@ def test_failed_ai_calls_are_logged_with_their_outcome(settings, gemini, caplog)
     assert ev.outcome == "refused" and ev.levelno == logging.WARNING
 
 
+def test_outage_event_counts_the_retried_requests(settings, gemini, caplog):
+    import httpx
+
+    from ti2dac.llm import LLMOutage
+
+    with pytest.raises(LLMOutage):
+        _ask(gemini([httpx.ConnectError("reset")] * 3))
+    (ev,) = _events(caplog, "ai.call")
+    assert ev.outcome == "outage" and ev.requests == 3 and ev.attempts == 0   # sent three times, nothing answered
+
+
 def test_json_lines_carry_context_and_never_keys(settings, tmp_path):
     settings.log.dir = str(tmp_path / "logs")
     path = obs.setup(settings, component="web")

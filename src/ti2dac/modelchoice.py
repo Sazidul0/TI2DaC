@@ -9,11 +9,12 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import ENV_MODEL_VARS, PROVIDERS, STAGES, Settings, apply_ai_env, apply_model_choice, read_model_choice, \
-    write_model_choice
+from .config import ENV_MODEL_VARS, PROVIDERS, STAGES, Settings, apply_ai_env, apply_model_choice, model_choice_path, \
+    read_model_choice, write_model_choice
 from .llm import FALLBACK_MODELS, price
 
 # Built-in choices, shown even before the provider's list has been fetched. Notes are what matters for this
@@ -56,7 +57,8 @@ def available(settings: Settings, provider: str) -> list[dict]:
     """Catalog models first, then other models from the provider's fetched list. Never contacts the provider."""
     out = [dict(m, listed=True) for m in CATALOG[provider]]
     known = {m["id"] for m in out}
-    live = _cached(settings.state_dir).get(provider, {}).get("models", [])
+    live = [m for m in _cached(settings.state_dir).get(provider, {}).get("models", [])
+            if provider != "gemini" or not _NOT_TEXT.search(m["id"])]   # lists fetched before the filter existed
     for m in live:
         if m["id"] not in known:
             out.append({"id": m["id"], "name": m.get("name") or m["id"], "note": "", "listed": True})
@@ -98,6 +100,10 @@ def _list_anthropic() -> list[dict]:
     return [{"id": m.id, "name": m.display_name} for m in client.models.list(limit=100) if m.id.startswith("claude")]
 
 
+# Gemini models that answer generateContent but cannot write rules (speech, images, robotics, computer use)
+_NOT_TEXT = re.compile(r"tts|image|nano-banana|robotics|computer-use|transcribe|live|audio|embedding")
+
+
 def _list_gemini() -> list[dict]:
     from google import genai
     from google.genai import types
@@ -106,7 +112,8 @@ def _list_gemini() -> list[dict]:
     out = []
     for m in client.models.list():
         mid = (m.name or "").removeprefix("models/")
-        if mid.startswith("gemini") and "generateContent" in (m.supported_actions or []):
+        if mid.startswith("gemini") and "generateContent" in (m.supported_actions or []) \
+                and not _NOT_TEXT.search(mid):
             out.append({"id": mid, "name": m.display_name or mid})
     return out
 
@@ -136,7 +143,20 @@ def choose(settings: Settings, provider: str, models: dict[str, str], actor: str
         raise ValueError(f"not a {PROVIDER_LABELS[provider]} model ti2dac knows: {', '.join(bad)}. "
                          "Refresh the model list if it is new.")
     write_model_choice(settings.state_dir, provider, models, actor)
+    return reload(settings)
+
+
+def reload(settings: Settings) -> Settings:
+    """A NEW settings object with the saved choice re-applied (running jobs keep the old one)."""
     new = copy.deepcopy(settings)
     apply_model_choice(new, read_model_choice(settings.state_dir))
     apply_ai_env(new)
     return new
+
+
+def saved_mtime(settings: Settings) -> float:
+    """When the choice was last saved (by any process), 0 if never."""
+    try:
+        return model_choice_path(settings.state_dir).stat().st_mtime
+    except OSError:
+        return 0.0

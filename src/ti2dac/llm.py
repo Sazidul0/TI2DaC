@@ -74,6 +74,17 @@ def _is_quota(message: str) -> bool:
     return any(h in m for h in _QUOTA_HINTS)
 
 
+def _quota_summary(message: str) -> str:
+    """Google's quota errors are several paragraphs; keep the limit and the model it applies to."""
+    m = re.search(r"limit: (\d+), model: ([\w.-]+)", message or "")
+    if not m:
+        return " ".join((message or "").split())[:300]
+    period = " per day" if "per day" in message.lower() else " per minute" if "per minute" in message.lower() else ""
+    tier = " (free tier)" if "free_tier" in message.lower() or "free tier" in message.lower() else ""
+    return (f"Google quota of {m[1]} requests{period} for {m[2]} used up{tier}. "
+            "Each Gemini model has its own quota; another model or a paid key can continue.")
+
+
 def _is_transport_error(e: Exception) -> bool:
     """Network-level failure from an HTTP stack (DNS, TLS, reset, timeout), not an API answer."""
     return isinstance(e, (OSError, TimeoutError)) or type(e).__module__.split(".")[0] in ("httpx", "httpcore", "httpx2")
@@ -187,6 +198,7 @@ class LLM:
         self._calls = threading.local()   # per-thread attempts of the call in flight, for its ai.call event
         self._client: anthropic.Anthropic | None = None
         self._gclient = None
+        self._gone: dict[str, str] = {}    # model -> why the provider said it does not exist for this key
         self.cache_dir = Path(settings.cache_dir) / "llm"
 
     @property
@@ -314,10 +326,13 @@ class LLM:
 
     def _call_provider(self, provider: str, stage: str, cfg: StageConfig, system: str, user: str,
                        schema: type[BaseModel]) -> str:
-        self._calls.attempts, self._calls.cost, self._calls.fallback = [], 0.0, False
+        self._calls.attempts, self._calls.cost, self._calls.fallback, self._calls.requests = [], 0.0, False, 0
         t0, outcome = time.monotonic(), "ok"
         try:
             self._gate(stage, provider)
+            if cfg.model in self._gone:
+                raise LLMError(f"{stage}: {cfg.model} is not available to this key, no request sent "
+                               f"(earlier answer: {self._gone[cfg.model]}). Choose another model.")
             if provider == "gemini":
                 text = self._call_gemini(stage, cfg, system, user, schema)
             else:
@@ -347,7 +362,7 @@ class LLM:
         attempts = getattr(self._calls, "attempts", [])
         obs.event("ai.call", logging.INFO if outcome == "ok" else logging.WARNING, stage=stage, provider=provider,
                   model=cfg.model, served_by=attempts[-1]["model"] if attempts else "", outcome=outcome,
-                  latency_ms=round(seconds * 1000), attempts=len(attempts), fallback=getattr(self._calls, "fallback", False),
+                  latency_ms=round(seconds * 1000), attempts=len(attempts), requests=getattr(self._calls, "requests", 0), fallback=getattr(self._calls, "fallback", False),
                   cost_usd=round(getattr(self._calls, "cost", 0.0), 6),
                   **{k: sum(a[k] for a in attempts) for k in _TOKEN_KEYS})
 
@@ -374,6 +389,7 @@ class LLM:
 
     def _sent(self, provider: str) -> None:
         aistatus.count_request(self.settings.state_dir, provider)
+        self._calls.requests = getattr(self._calls, "requests", 0) + 1   # HTTP requests, retries included
 
     def _block(self, stage: str, provider: str, state: str, message: str, retry_after_s: float | None) -> LLMLimitError:
         aistatus.record_block(self.settings.state_dir, provider, state, message, retry_after_s)
@@ -422,6 +438,9 @@ class LLM:
             if _is_quota(e.message):   # e.g. "credit balance is too low", workspace spend limit reached
                 raise self._block(stage, "anthropic", "quota_exhausted", e.message, None) from e
             raise LLMError(f"{stage}: bad request: {e.message}") from e
+        except anthropic.NotFoundError as e:
+            self._gone[cfg.model] = e.message[:200]
+            raise LLMError(f"{stage}: model {cfg.model} not found: {e.message}") from e
         except anthropic.APIStatusError as e:
             if e.status_code >= 500:   # 500/529 overloaded, after the SDK's own retries
                 raise self._outage(stage, "anthropic", f"Anthropic API unavailable ({e.status_code}): {e.message}") from e
@@ -498,7 +517,7 @@ class LLM:
                     delay = _retry_delay(e)
                     if _is_quota(msg) or (delay or 0) > 300:
                         # Daily / free-tier quota: retrying cannot succeed and only looks like abuse. Stop now.
-                        raise self._block(stage, "gemini", "quota_exhausted", f"{cfg.model}: {msg}", delay) from e
+                        raise self._block(stage, "gemini", "quota_exhausted", f"{cfg.model}: {_quota_summary(msg)}", delay) from e
                     if attempt < 2:
                         wait = min(delay or 15 * (attempt + 1), 60)
                         log.warning("%s: Gemini rate limit, one retry in %ss", stage, wait)
@@ -507,6 +526,8 @@ class LLM:
                     raise self._block(stage, "gemini", "rate_limited", f"{cfg.model}: {msg}", delay or 60) from e
                 if e.code in (401, 403) or "api key not valid" in msg.lower() or "api_key_invalid" in msg.lower():
                     raise self._block(stage, "gemini", "auth_error", f"Gemini rejected the API key (GEMINI_API_KEY): {msg}", None) from e
+                if e.code == 404:   # retired or unknown model: every later call with it would fail the same way
+                    self._gone[cfg.model] = msg[:200]
                 raise LLMError(f"{stage}: Gemini error {e.code}: {msg}") from e
             except gerrors.ServerError as e:
                 if attempt < 2:

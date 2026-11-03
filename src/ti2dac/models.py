@@ -69,6 +69,16 @@ class TimelineEvent(BaseModel):
     event: str
 
 
+class SequenceDraft(BaseModel):
+    """Behaviours the report says happened together. Only proposed by the AI; the join is built by code."""
+    name: str = Field(description="<= 8 words")
+    behaviour_ids: list[str] = Field(description="2-4 behaviour ids (B1, B3 ...) in the order they happened")
+    ordered: bool = Field(description="true when the report gives the order")
+    within: str = Field(description="time window the report supports, e.g. 10m, 1h, 1d")
+    join_on: Literal["host", "user", "source_ip"] = Field(description="what the steps share")
+    evidence: str = Field(description="VERBATIM quote <= 200 chars showing the steps belong together")
+
+
 class ReportAnalysis(BaseModel):
     title: str
     actors: list[str]
@@ -77,6 +87,10 @@ class ReportAnalysis(BaseModel):
     summary: str = Field(description="<= 60 words")
     behaviours: list[ExtractedBehaviour]
     timeline: list[TimelineEvent] = Field(description="<= 8 key events, empty if none")
+    sequences: list[SequenceDraft] = Field(
+        default_factory=list,
+        description="[] unless the report explicitly ties 2-4 of the behaviours together on one host/user/source "
+                    "within a short time (e.g. brute force, then a successful logon, then a scheduled task)")
 
 
 # --------------------------------------------------------------------------- stage 2 (generate)
@@ -102,7 +116,8 @@ class LogSource(BaseModel):
 
 
 class CorrelationDraft(BaseModel):
-    type: Literal["event_count", "value_count", "temporal"]
+    # Thresholds only. Multi-event sequences are built by code from separate rules (SequenceDraft / chains).
+    type: Literal["event_count", "value_count"]
     group_by: list[str] = Field(description="Fields to group by, e.g. [IpAddress] or [Computer, User]")
     timespan: str = Field(description="e.g. 5m, 1h")
     gte: int = Field(description="Threshold: alert when the count is >= this")
@@ -123,9 +138,10 @@ class SigmaDraft(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _legacy(cls, data):   # records written before correlation support
+    def _legacy(cls, data):   # records written before correlation support / with a single-rule "temporal"
         if isinstance(data, dict):
             data.setdefault("correlation", [])
+            data["correlation"] = [c for c in data["correlation"] or [] if not (isinstance(c, dict) and c.get("type") == "temporal")]
         return data
 
 
@@ -248,7 +264,9 @@ class QueryResult(BaseModel):
     target: str
     label: str
     language: str
-    method: Literal["pysigma", "llm"]
+    # pysigma = backend; template = ti2dac code (Wazuh XML, correlation wrappers); llm = AI, unverified
+    method: Literal["pysigma", "template", "llm"]
+    client: str = ""                 # client profile the query was produced for ("" = default schema)
     query: str | None = None
     error: str | None = None
     notes: str = ""
@@ -258,6 +276,7 @@ class QueryResult(BaseModel):
 class FieldMapping(BaseModel):
     sigma_field: str
     targets: dict[str, str]          # target -> mapped field(s) or "UNSUPPORTED: reason"
+    client: str = ""
 
 
 class LintFinding(BaseModel):
@@ -292,6 +311,21 @@ class DetectionPackage(BaseModel):
     history: list[dict[str, str]] = []   # previous versions: {version, rule_yaml, replaced_at, reason}
 
 
+class ChainPackage(BaseModel):
+    """A multi-event detection joined by code from already generated single-event rules."""
+    slug: str                        # chain-001
+    name: str
+    steps: list[str]                 # package slugs, in order
+    ordered: bool
+    within: str
+    join_on: str
+    source: Literal["analysis", "analyst"] = "analysis"
+    evidence: str = ""
+    rule_yaml: str                   # the steps' base rules plus a Sigma correlation rule
+    queries: list[QueryResult] = []
+    warnings: list[str] = []
+
+
 class Usage(BaseModel):
     calls: int = 0
     cached_calls: int = 0
@@ -322,5 +356,6 @@ class RunRecord(BaseModel):
     analysis: ReportAnalysis | None = None
     behaviours: list[Behaviour] = []
     packages: list[DetectionPackage] = []
+    chains: list[ChainPackage] = []
     usage: Usage = Usage()
     warnings: list[str] = []

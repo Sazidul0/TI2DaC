@@ -149,6 +149,16 @@ def create_app(settings: Settings) -> FastAPI:
     store.interrupt_running_jobs()   # jobs from a previous process cannot still be running
     key_checks: dict[str, dict] = {}   # provider -> last key check shown on the AI page (never the key)
     model_msgs: dict[str, dict] = {}   # provider -> last model save / list refresh result
+    choice_seen = [modelchoice.saved_mtime(settings)]
+
+    @app.middleware("http")
+    async def _sync_model_choice(request: Request, call_next):
+        """Pick up a model choice saved outside this process (`ti2dac model`, another server worker)."""
+        nonlocal settings
+        m = modelchoice.saved_mtime(settings)
+        if m != choice_seen[0]:
+            choice_seen[0], settings = m, modelchoice.reload(settings)
+        return await call_next(request)
 
     def run_dir(run_id: str) -> Path:
         p = store.run_path(run_id)
@@ -531,6 +541,7 @@ def create_app(settings: Settings) -> FastAPI:
     @app.post("/ai/key")
     def ai_key(request: Request, provider: str = Form(...), action: str = Form(...), key: str = Form("")):
         """Save, test or remove a provider API key (admins only). Saved to the server's .env, never to the database."""
+        nonlocal settings
         if request.state.role != "admin":
             raise HTTPException(403, "only admins can manage API keys")
         if provider not in KEY_VARS or action not in ("save", "test", "remove"):
@@ -547,6 +558,18 @@ def create_app(settings: Settings) -> FastAPI:
             if ok:   # the model picker can now offer what this key can use
                 listed, _ = modelchoice.refresh(settings, provider)
                 msg += " Choose its model under Model below." if listed else ""
+            active = settings.ai.provider
+            if ok and provider != active and aistatus.key_status(active) == "not configured" and not modelchoice.env_locks():
+                # The active provider cannot run at all; a working key for the other one should just work.
+                try:
+                    settings = modelchoice.choose(settings, provider, modelchoice.current(settings, provider), user)
+                except ValueError as e:
+                    msg += f" It was not made the active provider: {e}"
+                else:
+                    store.audit(user, "ai.models.set", {"provider": provider, "models": modelchoice.current(settings, provider),
+                                                        "reason": f"{active} has no key"})
+                    msg += (f" {KEY_VARS[provider][1]} is now the active provider, because {KEY_VARS[active][1]} has no key."
+                            " Change it under Model below.")
         elif action == "test":
             if not os.environ.get(var):
                 raise HTTPException(400, f"no {var} to test")

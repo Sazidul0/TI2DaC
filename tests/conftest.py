@@ -13,6 +13,12 @@ from ti2dac.models import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_local_env_file(monkeypatch, tmp_path):
+    """Tests never read the developer's real .env, which may hold live API keys."""
+    monkeypatch.setenv("TI2DAC_ENV_FILE", str(tmp_path / "absent.env"))
+
+
 def ev(desc: str, match: bool, **fields) -> TestEvent:
     return TestEvent(description=desc, should_match=match, fields=[EventField(name=k, value=v) for k, v in fields.items()])
 

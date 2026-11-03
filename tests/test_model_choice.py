@@ -93,3 +93,23 @@ def test_cli_model_command(settings, monkeypatch, tmp_path):
     r = runner.invoke(app, ["model"])
     assert "claude-fable-5-1" in r.output and "in use:" in r.output
     assert runner.invoke(app, ["model", "nope-1"]).exit_code == 1
+
+
+def test_web_picks_up_a_choice_saved_by_the_cli(settings):
+    from ti2dac.web.app import create_app
+
+    client = TestClient(create_app(settings))
+    assert client.get("/api/ai-status").json()["provider"] == "anthropic"
+    modelchoice.choose(settings, "gemini", _all("gemini-flash-latest"), "cli-user")   # another process
+    assert client.get("/api/ai-status").json()["provider"] == "gemini"
+
+
+def test_non_text_gemini_models_are_not_offered(settings, monkeypatch):
+    path = model_choice_path(settings.state_dir).parent / "model_list.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"gemini": {"fetched_at": "x", "models": [
+        {"id": "gemini-3.5-flash"}, {"id": "gemini-2.5-flash-preview-tts"}, {"id": "gemini-3-pro-image"},
+        {"id": "gemini-robotics-er-2-preview"}]}}))
+    ids = {m["id"] for m in modelchoice.available(settings, "gemini")}
+    assert "gemini-3.5-flash" in ids and not ids & {"gemini-2.5-flash-preview-tts", "gemini-3-pro-image",
+                                                    "gemini-robotics-er-2-preview"}

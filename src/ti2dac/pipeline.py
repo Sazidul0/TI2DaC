@@ -16,7 +16,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from . import __version__, attack, duplicates, obs, quality, redact, replay, safety
+from . import __version__, attack, chains, clients, duplicates, obs, quality, redact, replay, safety
 from . import sigma_tools as st
 from .condense import condense, procedure_signals
 from .config import Settings
@@ -32,7 +32,7 @@ from .prompts import (
     ANALYZE_SYSTEM, FAMILY_HINTS, GENERATE_SYSTEM, PROMPT_VERSION, REPAIR_SYSTEM, TRANSLATE_SYSTEM,
     analyze_user, generate_user, repair_user, translate_user,
 )
-from .targets import FAMILIES, LLM_TARGET_LABELS, NATIVE_FIELDS, RENAMING_TARGETS
+from .targets import FAMILIES, LLM_TARGET_LABELS, NATIVE_FIELDS, RENAMING_TARGETS, TARGETS
 
 log = logging.getLogger(__name__)
 Progress = Callable[[str], None]
@@ -162,6 +162,8 @@ def analyze(loaded: LoadedReport, settings: Settings, llm: LLM | None, progress:
         warnings.append(f"The report has little procedural detail ({signals} command/tool/registry signals). It reads like a "
                         "trend or strategic report; generated rules will be generic. Prefer incident write-ups (DFIR Report, "
                         "CISA advisories, vendor case studies) for detection engineering.")
+    run_id = _new_run_id(loaded, settings.output_dir)
+    obs.run_id.set(run_id)   # so the analysis call's ai.call event carries it
     if llm is not None:
         progress("stage 1: extracting behaviours")
         analysis = llm.structured("analyze", ANALYZE_SYSTEM,
@@ -171,13 +173,14 @@ def analyze(loaded: LoadedReport, settings: Settings, llm: LLM | None, progress:
         warnings.append("AI disabled: behaviours limited to explicitly cited ATT&CK IDs; write Sigma rules manually "
                         "and use `ti2dac convert`.")
     behaviours = build_behaviours(analysis, loaded.text)
+    _check_sequences(analysis, behaviours, loaded.text, warnings)
     for b in behaviours:
         if not any(b.evidence_verified):
             warnings.append(f"{b.id}: no evidence quote could be verified in the source (possible hallucination)")
         if b.attack_note:
             warnings.append(f"{b.id}: {b.attack_note}")
     record = RunRecord(
-        run_id=_new_run_id(loaded, settings.output_dir), created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        run_id=run_id, created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         tool_version=__version__, prompt_version=PROMPT_VERSION, ai_enabled=llm is not None,
         report=loaded.meta, iocs=iocs, analysis=analysis, behaviours=behaviours, warnings=warnings,
     )
@@ -192,6 +195,23 @@ def analyze(loaded: LoadedReport, settings: Settings, llm: LLM | None, progress:
         warnings.append("The report does not look like English. Condensing heuristics are English-tuned, so more "
                         "context may be dropped; check behaviour-analysis.yaml against the source.")
     return record, warnings
+
+
+def _check_sequences(analysis: ReportAnalysis, behaviours: list[Behaviour], source_text: str, warnings: list[str]) -> None:
+    """Keep only proposed sequences whose steps exist and whose quote is really in the report."""
+    known, norm_source, kept = {b.id for b in behaviours}, _norm(source_text), []
+    for s in analysis.sequences:
+        ids = list(dict.fromkeys(s.behaviour_ids))
+        if not 2 <= len(ids) <= 4 or not set(ids) <= known:
+            warnings.append(f"Sequence '{s.name}' dropped: it must reference 2-4 extracted behaviours (got {', '.join(s.behaviour_ids)})")
+        elif not verify_evidence(s.evidence, norm_source):
+            warnings.append(f"Sequence '{s.name}' dropped: its evidence quote is not in the report (possible hallucination)")
+        elif not re.fullmatch(r"[1-9]\d{0,3}[smhd]", s.within.strip()):
+            warnings.append(f"Sequence '{s.name}' dropped: time window {s.within!r} is not like 10m, 1h or 1d")
+        else:
+            s.behaviour_ids, s.within = ids, s.within.strip()
+            kept.append(s)
+    analysis.sequences = kept
 
 
 _EN_STOP = set("the and of to in is that for with was were this by on as from be are it an or have has which".split())
@@ -247,22 +267,29 @@ def _check(pkg: DetectionPackage, settings: Settings, record: RunRecord | None =
         placeholder_issue = [f"quality: the rule uses redacted placeholders {leaked} (specific hosts/users/IPs of "
                              "this incident). Remove them; detect the technique on any host."]
     pkg.queries = st.convert(pkg.rule_yaml, settings.targets, settings.index_overrides)
+    for c in clients.active(settings):   # the same rule in each client's own field names
+        pkg.queries += st.convert(pkg.rule_yaml, c.targets or settings.targets, c.index_overrides, c)
     # Backends with strict field validation reject fields that are not in the Sigma taxonomy. One
     # backend rejecting a field is a vendor gap (documented in the field mapping); two or more
     # means the rule itself is wrong and is worth a repair call.
     probe = st.convert(pkg.rule_yaml, [t for t in _STRICT_TARGETS if t not in settings.targets]) if \
         any(t not in settings.targets for t in _STRICT_TARGETS) else []
     field_errors = [f"{q.target}: {q.error}" for q in pkg.queries + probe
-                    if q.target in _STRICT_TARGETS and q.error and "field" in q.error.lower()]
+                    if not q.client and q.target in _STRICT_TARGETS and q.error and "field" in q.error.lower()]
     # Unit-test the rule against the events its own simulation should produce (and benign look-alikes).
     pkg.selftest, pkg.selftest_details = replay.selftest(pkg.rule_yaml, pkg.draft.test_events)
     selftest_issue = [f"self-test: {d}" for d in pkg.selftest_details] if pkg.selftest == "fail" else []
-    if settings.telemetry:
-        ls = st.first_doc(pkg.rule_yaml).get("logsource") or {}
-        key = f"{ls.get('product', '')}:{ls.get('category') or ls.get('service', '')}"
-        if key not in settings.telemetry:
-            pkg.quality_warnings.append(f"Log source {key} is not in your telemetry inventory ({', '.join(settings.telemetry)}); "
-                                        "this rule cannot fire until that data is collected.")
+    ls = st.first_doc(pkg.rule_yaml).get("logsource") or {}
+    # A rule naming both a category and a service (windows authentication + security) is covered by either.
+    keys = [f"{ls.get('product', '')}:{ls[k]}" for k in ("category", "service") if ls.get(k)] or [f"{ls.get('product', '')}:"]
+    key = keys[0]
+    if settings.telemetry and not set(keys) & set(settings.telemetry):
+        pkg.quality_warnings.append(f"Log source {key} is not in your telemetry inventory ({', '.join(settings.telemetry)}); "
+                                    "this rule cannot fire until that data is collected.")
+    for c in clients.active(settings):
+        if c.telemetry and not set(keys) & set(c.telemetry):
+            pkg.quality_warnings.append(f"Client {c.name} does not collect {key} ({', '.join(c.telemetry)}); "
+                                        "this rule cannot fire there until it does.")
     return (field_errors if len(field_errors) >= 2 else []) + brittle_issue + selftest_issue + placeholder_issue
 
 
@@ -282,44 +309,143 @@ def _lint_simulation(pkg: DetectionPackage) -> None:
     pkg.sim_blocked = any(f.severity == "block" for f in pkg.sim_lint)
 
 
+_REFERENCE_ORDER = ("elastic_esql", "splunk", "sentinel_asim", "defender_xdr", "crowdstrike_cql", "elastic_eql")
+
+
+def _ai_fields(pkg: DetectionPackage, client, members: list[str], tid: str) -> dict[str, str]:
+    """Sigma field -> target name the AI must use: the deterministic mapping of the target family,
+    overridden by the client profile. The same map is used to check the answer."""
+    cname = client.name if client is not None else ""
+    out: dict[str, str] = {}
+    for fm in pkg.field_mappings:
+        if fm.client != cname:
+            continue
+        for t in members:
+            v = fm.targets.get(t, "")
+            if v and not v.startswith("UNSUPPORTED"):
+                out[fm.sigma_field] = v
+                break
+    if client is not None:
+        used = set(st.rule_fields(pkg.rule_yaml))
+        for t in [*members, tid]:
+            out.update({f: n for f, n in client.fields_for(t).items() if f in used})
+    return out
+
+
+def _ai_references(pkg: DetectionPackage, cname: str) -> dict[str, str]:
+    """Up to two verified converter outputs, so the AI copies the logic instead of re-deriving it."""
+    ok = {q.target: q for q in pkg.queries if q.client == cname and q.query and q.method != "llm"}
+    picks = [t for t in _REFERENCE_ORDER if t in ok][:2]
+    return {TARGETS[t].label: ok[t].query[:1200] for t in picks}
+
+
+def check_ai_query(query: str, fields: dict[str, str], target: str) -> list[str]:
+    """Deterministic checks of an AI translation against the field map (and XML well-formedness for Wazuh)."""
+    import xml.etree.ElementTree as ET
+
+    problems = []
+    for sigma, mapped in fields.items():
+        names = [n.strip() for n in mapped.split(",") if n.strip()]
+        if names and not any(n in query for n in names):
+            problems.append(f"does not use {names[0]} (Sigma {sigma})")
+        if names and sigma not in names and re.search(rf"(?<![\w.]){re.escape(sigma)}(?![\w.])", query):
+            problems.append(f"uses the Sigma name {sigma} where the target field is {names[0]}")
+    if target.startswith(("sentinel", "defender")) and re.search(r"\[\s*@\w+\s*=", query):
+        problems.append("uses an XPath predicate ([@Name=...]), which KQL does not have; use mv-apply over the parsed array")
+    if target == "google_secops_yaral" and not (re.search(r"\brule\s+\w+\s*\{", query) and "events:" in query
+                                                 and "condition:" in query):
+        problems.append("not a YARA-L 2.0 rule (needs rule <name> { meta: events: condition: })")
+    if target.startswith("wazuh"):
+        if re.search(r"<!(DOCTYPE|ENTITY)", query, re.I):   # untrusted model output: never expand entities
+            problems.append("contains DTD/entity declarations, which Wazuh rules never need")
+        else:
+            try:
+                ET.fromstring(f"<root>{re.sub(r'<!--.*?-->', '', query, flags=re.S)}</root>")
+            except ET.ParseError as e:
+                problems.append(f"not well-formed XML ({e})")
+    return problems
+
+
 def _translate_llm(pkg: DetectionPackage, settings: Settings, llm: LLM) -> None:
-    """AI translations: configured non-pySigma SIEMs, plus families no pySigma target could convert."""
-    jobs: list[tuple[str, str, str, str, str]] = []   # (target id, label, language, hint, why)
-    by_target = {q.target: q for q in pkg.queries}
-    for fam in settings.ai_fill_gaps:
-        members, label, lang = FAMILIES.get(fam, ([], "", ""))
-        configured = [t for t in members if t in by_target]
-        if configured and all(by_target[t].error for t in configured):
-            why = "; ".join(f"{t}: {by_target[t].error}" for t in configured)[:400]
-            jobs.append((f"{fam}_ai", label, lang, FAMILY_HINTS.get(fam, ""), why))
-    for tid in settings.llm_targets:
-        label, lang = LLM_TARGET_LABELS.get(tid, (tid, tid))
-        jobs.append((tid, label, lang, "", ""))
-    for tid, label, lang, hint, why in jobs:
-        res = QueryResult(target=tid, label=label + " [AI-translated, unverified]", language=lang, method="llm")
-        try:
-            t = llm.structured("translate", TRANSLATE_SYSTEM, translate_user(pkg.rule_yaml, label, lang, hint, why),
-                               TranslationDraft)
-            res.query, res.notes = t.query.strip(), f"confidence={t.confidence}; {t.notes}"
-        except LLMError as e:
-            res.error, res.validation = str(e), "failed"
-        pkg.queries.append(res)
+    """AI translations: configured non-pySigma SIEMs, plus families no converter could produce, for the default
+    schema and each client profile. The AI gets the field map and verified reference queries, and its answer is
+    checked against the same map. Correlation rules are never sent: thresholds and joins are built by code."""
+    correlated = len(st.load_docs(pkg.rule_yaml)) > 1
+    default_results: dict[str, QueryResult] = {}
+    for client in [None, *clients.active(settings)]:
+        cname = client.name if client is not None else ""
+        by_target = {q.target: q for q in pkg.queries if q.client == cname}
+        jobs: list[tuple[str, str, str, str, str, list[str]]] = []   # (id, label, language, hint, why, family members)
+        for fam in settings.ai_fill_gaps:
+            members, label, lang = FAMILIES.get(fam, ([], "", ""))
+            configured = [t for t in members if t in by_target]
+            if configured and all(by_target[t].error for t in configured) and not correlated:
+                why = "; ".join(f"{t}: {by_target[t].error}" for t in configured)[:400]
+                jobs.append((f"{fam}_ai", label, lang, FAMILY_HINTS.get(fam, ""), why, configured))
+        for tid in (client.llm_targets if client is not None else settings.llm_targets):
+            label, lang = LLM_TARGET_LABELS.get(tid, (tid, tid))
+            if correlated:
+                pkg.queries.append(QueryResult(target=tid, label=label, language=lang, method="llm", client=cname,
+                                               validation="failed", error="threshold rule: correlation logic is only "
+                                               "built by code, and this SIEM has no converter"))
+                continue
+            jobs.append((tid, label, lang, FAMILY_HINTS.get(tid, ""), "", [tid]))
+        for tid, label, lang, hint, why, members in jobs:
+            prev = default_results.get(tid)
+            if client is not None and prev is not None and prev.query and not any(
+                    client.fields_for(t) or client.index_overrides.get(t) for t in [tid, *members]) \
+                    and not client.notes_for(tid):
+                # Nothing client-specific to tell the AI: the default translation is the client's query too.
+                pkg.queries.append(prev.model_copy(update={"client": cname, "notes": f"{prev.notes} Same as the default "
+                                                           f"translation: {cname} has no field map, index or notes for it."}))
+                continue
+            fields = _ai_fields(pkg, client, members, tid)
+            res = QueryResult(target=tid, label=label + " [AI-translated, unverified]", language=lang, method="llm",
+                              client=cname)
+            try:
+                t = llm.structured("translate", TRANSLATE_SYSTEM,
+                                   translate_user(pkg.rule_yaml, label, lang, hint, why, fields,
+                                                  _ai_references(pkg, cname), client.notes_for(tid) if client else ""),
+                                   TranslationDraft)
+                res.query, res.notes = t.query.strip(), f"confidence={t.confidence}; {t.notes}"
+                problems = check_ai_query(res.query, fields, tid)
+                if problems:
+                    res.notes += " CHECK: " + "; ".join(problems)
+            except LLMError as e:
+                res.error, res.validation = str(e), "failed"
+            pkg.queries.append(res)
+            if client is None:
+                default_results[tid] = res
 
 
-def _flag_unmapped_fields(pkg: DetectionPackage) -> None:
+def _flag_unmapped_fields(pkg: DetectionPackage, settings: Settings) -> None:
     """A renaming pipeline that left a field unchanged did not map it: the query may never match.
 
     If NONE of the rule's fields were mapped, the pipeline does not know this log source at all (e.g. the
     CrowdStrike pipeline for Sysmon registry events): the query is marked failed so the AI gap translator
-    writes a native one instead of shipping a query that can never match."""
+    writes a native one instead of shipping a query that can never match. For a client with a field map
+    for the target, every field the map does not cover is reported, whatever the target."""
+    profiles = {c.name: c for c in clients.active(settings)}
+    maps: dict[tuple[str, str], dict[str, str]] = {}
+    for fm in pkg.field_mappings:
+        for tid, v in fm.targets.items():
+            maps.setdefault((fm.client, tid), {})[fm.sigma_field] = v
     for q in pkg.queries:
-        if not q.query or q.target not in RENAMING_TARGETS:
+        if not q.query or q.method == "llm":
             continue
-        fields = [fm.sigma_field for fm in pkg.field_mappings if not fm.targets.get(q.target, "").startswith("UNSUPPORTED")]
+        m = {f: v for f, v in maps.get((q.client, q.target), {}).items() if not v.startswith("UNSUPPORTED")}
         native = NATIVE_FIELDS.get(q.target, set())
-        unmapped = [f for f in fields if dict((fm.sigma_field, fm.targets.get(q.target)) for fm in pkg.field_mappings)[f] == f
-                    and f not in native]
-        if fields and len(unmapped) == len(fields):
+        declared = profiles[q.client].fields_for(q.target) if q.client in profiles else {}
+        if declared:
+            missing = [f for f, v in m.items() if f not in declared and v == f and f not in native]
+            if missing:
+                q.notes = (f"{q.notes} Not in client {q.client}'s field map for {q.target} (kept the Sigma name; add them "
+                           f"to the profile if the client names them differently): {', '.join(missing)}").strip()
+            continue
+        if q.target not in RENAMING_TARGETS:
+            continue
+        unmapped = [f for f, v in m.items() if v == f and f not in native]
+        if m and len(unmapped) == len(m):
             q.error = (f"{q.target} pipeline has no field mapping for this log source "
                        f"({', '.join(unmapped)} passed through unchanged); it will not match normalized data")
             q.notes = f"{q.notes} Raw pass-through query, only for un-normalized data: {q.query}".strip()
@@ -350,7 +476,9 @@ def finalize_package(pkg: DetectionPackage, record: RunRecord, settings: Setting
         blocking = _check(pkg, settings, record)
     if pkg.sigma_status != "failed":
         pkg.field_mappings = st.field_mappings(pkg.rule_yaml, settings.targets)
-        _flag_unmapped_fields(pkg)
+        for c in clients.active(settings):
+            pkg.field_mappings += st.field_mappings(pkg.rule_yaml, c.targets or settings.targets, c)
+        _flag_unmapped_fields(pkg, settings)
         pkg.similar_rules = duplicates.find_similar(pkg.rule_yaml, settings)
         if llm is not None:
             _translate_llm(pkg, settings, llm)
@@ -416,9 +544,66 @@ def generate(record: RunRecord, settings: Settings, llm: LLM, store: Store | Non
         if p.slug != f"rule-{i:03d}":
             p.slug = f"rule-{i:03d}"
     record.packages.extend(pkgs)
+    rebuild_chains(record, settings, progress)
     record.usage = llm.usage
     record.usage.estimated_cost_usd = estimate_cost(record.usage, settings.ai.prices)
     return pkgs
+
+
+def rebuild_chains(record: RunRecord, settings: Settings, progress: Progress = _noop) -> None:
+    """(Re)build every multi-event chain from the current rule versions: the sequences the analysis proposed
+    (once all their steps have rules) plus chains an analyst defined. Deterministic, no AI calls."""
+    by_beh = {p.behaviour.id: p for p in record.packages}
+    by_slug = {p.slug: p for p in record.packages}
+    specs = []
+    for s in (record.analysis.sequences if record.analysis else []):
+        missing = [b for b in s.behaviour_ids if b not in by_beh]
+        if missing:
+            note = (f"Sequence '{s.name}' ({' -> '.join(s.behaviour_ids)}) needs rules for {', '.join(missing)} first: "
+                    f"ti2dac generate {record.run_id} --select {','.join(missing)}")
+            if note not in record.warnings:
+                record.warnings.append(note)
+            continue
+        specs.append((s.name, [by_beh[b] for b in s.behaviour_ids], s.ordered, s.within, s.join_on, "analysis", s.evidence))
+    for c in record.chains:
+        if c.source == "analyst" and all(x in by_slug for x in c.steps):
+            specs.append((c.name, [by_slug[x] for x in c.steps], c.ordered, c.within, c.join_on, "analyst", c.evidence))
+    # A chain keeps its number across rebuilds (its folder and any deployed copy refer to it); new ones get the next.
+    def key(source, name, step_slugs):
+        return (source, name) if source == "analysis" else (source, name, tuple(step_slugs))
+    prev = {key(c.source, c.name, c.steps): c.slug for c in record.chains if c.slug}
+    last = max((int(x[6:]) for x in prev.values() if re.fullmatch(r"chain-\d+", x)), default=0)
+    built, active = [], clients.active(settings)
+    for name, steps, ordered, within, join_on, source, evidence in specs:
+        slug = prev.get(key(source, name, [p.slug for p in steps]))
+        if slug is None:
+            last += 1
+            slug = f"chain-{last:03d}"
+        try:
+            built.append(chains.build(steps, slug=slug, name=name, ordered=ordered, within=within,
+                                      join_on=join_on, source=source, evidence=evidence, settings=settings, clients=active))
+        except ValueError as e:
+            record.warnings.append(f"Sequence '{name}' not built: {e}")
+    record.chains = sorted(built, key=lambda c: c.slug)
+    if built:
+        progress(f"{len(built)} multi-event chain(s) built from the rules (no AI)")
+
+
+def add_chain(record: RunRecord, settings: Settings, slugs: list[str], *, name: str, within: str, join_on: str,
+              ordered: bool = True) -> None:
+    """An analyst-defined chain over existing rules (same deterministic build as proposed sequences)."""
+    known = {p.slug for p in record.packages}
+    if not 2 <= len(slugs) <= 4 or not set(slugs) <= known:
+        raise ValueError(f"a chain needs 2-4 existing rules of run {record.run_id} (have: {', '.join(sorted(known))})")
+    if not re.fullmatch(r"[1-9]\d{0,3}[smhd]", within):
+        raise ValueError("within must look like 10m, 1h or 1d")
+    if join_on not in ("host", "user", "source_ip"):
+        raise ValueError("join on host, user or source_ip")
+    from .models import ChainPackage
+
+    record.chains.append(ChainPackage(slug="", name=name, steps=slugs, ordered=ordered, within=within,
+                                      join_on=join_on, source="analyst", rule_yaml=""))
+    rebuild_chains(record, settings)
 
 
 def run(source: str, settings: Settings, **kw) -> tuple[RunRecord, LoadedReport]:
@@ -543,7 +728,7 @@ def replay_evidence(record: RunRecord, events: list[dict], store: Store | None, 
             pkg.quality_warnings.append(f"incident evidence replay failed: {e}")
             continue
         scoped = len(replay._scoped(events, st.first_doc(pkg.rule_yaml)))
-        pkg.evidence_matches, pkg.evidence_total = len(hits), len(events)
+        pkg.evidence_matches, pkg.evidence_total = len(hits), scoped   # events of the rule's log source type
         progress(f"{pkg.slug}: matches {len(hits)} of {scoped} relevant incident events")
         if hits and store is not None:
             store.add_test_result(tester=actor or "ti2dac", run_id=record.run_id, slug=pkg.slug, rule_version=pkg.version,
@@ -604,6 +789,7 @@ def apply_correction(record: RunRecord, slug: str, settings: Settings, *, correc
     if new.sigma_status == "failed":
         raise ValueError("corrected rule does not validate: " + "; ".join(new.sigma_issues[:5]))
     record.packages[idx] = new
+    rebuild_chains(record, settings, progress)
     return new
 
 

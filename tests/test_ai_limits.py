@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from google.genai import errors as gerrors
 
 from ti2dac import aistatus
-from ti2dac.llm import LLM, LLMLimitError
+from ti2dac.llm import LLM, LLMError, LLMLimitError
 from ti2dac.models import TranslationDraft
 
 OK_JSON = TranslationDraft(query="q", notes="n", confidence="high").model_dump_json()
@@ -182,8 +182,9 @@ def test_dotenv_is_loaded_but_real_environment_wins(tmp_path, monkeypatch):
 
     env = tmp_path / ".env"
     env.write_text("# keys\nGEMINI_API_KEY='from-file'\nexport TI2DAC_PROVIDER=gemini\nANTHROPIC_API_KEY=file\n")
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("TI2DAC_PROVIDER", raising=False)
+    for var in ("GEMINI_API_KEY", "TI2DAC_PROVIDER"):   # set first so monkeypatch restores what load_dotenv adds
+        monkeypatch.setenv(var, "")
+        monkeypatch.delenv(var)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "real")
     load_dotenv(env)
     import os
@@ -312,3 +313,26 @@ def test_unpriced_models_are_not_shown_as_free(settings, gemini):
     llm = gemini([])
     _ask(llm, 1)
     assert llm.usage.estimated_cost_usd == 0.02 and not llm.usage.unpriced_models
+
+
+def test_retired_model_is_not_called_again(settings, gemini):
+    gone = gerrors.ClientError(404, {"error": {"code": 404, "status": "NOT_FOUND",
+                                               "message": "models/gemini-2.5-flash is no longer available to new users"}})
+    llm = gemini([gone])
+    with pytest.raises(LLMError, match="no longer available"):
+        _ask(llm)
+    with pytest.raises(LLMError, match="no request sent"):
+        _ask(llm, 1)
+    assert llm._gclient.calls == 1
+    assert not aistatus.block_reason(settings.state_dir, "gemini"), "another model may still work: not a provider pause"
+
+
+def test_quota_message_keeps_limit_and_model(settings, gemini):
+    msg = ("You exceeded your current quota, please check your plan and billing details. For more information on this "
+           "error, head to: https://ai.google.dev/gemini-api/docs/rate-limits.\n* Quota exceeded for metric: "
+           "generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-3.8-flash, "
+           "description: Generate content requests per day limit exceeded on Free Tier.")
+    with pytest.raises(LLMLimitError) as e:
+        _ask(gemini([_gemini_429(msg, retry="120s")]))
+    assert "quota of 20 requests per day for gemini-3.8-flash used up (free tier)" in str(e.value)
+    assert "https://" not in str(e.value) and len(str(e.value)) < 300

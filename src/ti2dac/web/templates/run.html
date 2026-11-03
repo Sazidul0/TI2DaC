@@ -78,7 +78,7 @@
           in {{ "{:,}".format(r.usage.input_tokens) }} / out {{ "{:,}".format(r.usage.output_tokens) }} tokens
           {% if r.usage.cache_read_tokens %}· cache read {{ "{:,}".format(r.usage.cache_read_tokens) }}{% endif %}
           {% if r.usage.cache_write_tokens %}· cache write {{ "{:,}".format(r.usage.cache_write_tokens) }}{% endif %}
-          · est. ${{ "%.4f"|format(r.usage.estimated_cost_usd or 0) }}{% if r.ai_provider %} · {{ r.ai_provider }}{% endif %}
+          · {% if r.usage.unpriced_models and not r.usage.estimated_cost_usd %}not priced{% else %}est. ${{ "%.4f"|format(r.usage.estimated_cost_usd or 0) }}{% endif %}{% if r.ai_provider %} · {{ r.ai_provider }}{% endif %}
           {% if r.usage.unpriced_models %}<div class="xs muted">No price known for {{ r.usage.unpriced_models|join(", ") }}: its tokens are not in the estimate (set <code>ai.prices</code>).</div>{% endif %}
           {% if r.usage.fallback_calls or r.usage.failover_calls or r.usage.schema_retries %}<div class="xs muted">
             {%- if r.usage.fallback_calls %}{{ r.usage.fallback_calls }} answered by the refusal-fallback model. {% endif %}
@@ -92,10 +92,10 @@
           <tbody>{% for stage, u in r.usage.by_stage.items() %}<tr><td>{{ stage }}</td><td><code>{{ u.model_price_key }}</code></td><td class="num">{{ u.calls }}</td>
             <td class="num">{{ u.cached_calls }}</td><td class="num">{{ "{:,}".format(u.input_tokens) }}</td><td class="num">{{ "{:,}".format(u.output_tokens) }}</td>
             <td class="num">{{ "{:,}".format(u.cache_read_tokens) }}</td><td class="num">{{ "{:,}".format(u.cache_write_tokens or 0) }}</td>
-            <td class="num">{{ ("$%.4f"|format(u.cost_usd)) if u.cost_usd is defined else "–" }}</td></tr>{% endfor %}</tbody>
+            <td class="num">{{ "not priced" if u.model_price_key in r.usage.unpriced_models and not u.cost_usd else ("$%.4f"|format(u.cost_usd)) if u.cost_usd is defined else "–" }}</td></tr>{% endfor %}</tbody>
           <tfoot><tr><td>Total</td><td></td><td class="num">{{ r.usage.calls }}</td><td class="num">{{ r.usage.cached_calls }}</td><td class="num">{{ "{:,}".format(r.usage.input_tokens) }}</td>
             <td class="num">{{ "{:,}".format(r.usage.output_tokens) }}</td><td class="num">{{ "{:,}".format(r.usage.cache_read_tokens) }}</td><td class="num">{{ "{:,}".format(r.usage.cache_write_tokens) }}</td>
-            <td class="num">${{ "%.4f"|format(r.usage.estimated_cost_usd or 0) }}</td></tr></tfoot>
+            <td class="num">{{ "not priced" if r.usage.unpriced_models and not r.usage.estimated_cost_usd else "$%.4f"|format(r.usage.estimated_cost_usd or 0) }}</td></tr></tfoot>
         </table></div>
         <p class="xs muted" style="margin-top:8px">Output tokens include the model's thinking. Analyse = 1 call per report; generate = 1 per rule;
           repair/translate only when needed. Cached calls cost nothing. Costs are priced at the model that actually answered.</p>
@@ -236,20 +236,21 @@
       <div role="tabpanel" data-panel="queries">
         <div class="split" data-tabs="">
           <div class="picker" role="tablist" aria-label="SIEM targets">
-            {% for q in p.queries %}{% set st = status[p.slug][q.target] %}
-            <button type="button" role="tab" data-tab="{{ q.target }}" aria-selected="{{ 'true' if loop.first else 'false' }}" title="{{ q.label }}">
-              <span class="dot {{ 'bad' if not q.query else ui.tone(st) if st != 'not-tested' else 'primary' }}"></span><span class="t">{{ q.label }}</span></button>
+            {% for q in p.queries %}{% set st = status[p.slug][q.target] if not q.client else 'not-tested' %}
+            <button type="button" role="tab" data-tab="{{ q.client }}:{{ q.target }}" aria-selected="{{ 'true' if loop.first else 'false' }}" title="{{ q.label }}">
+              <span class="dot {{ 'bad' if not q.query else ui.tone(st) if st != 'not-tested' else 'primary' }}"></span><span class="t">{% if q.client %}<b>{{ q.client }}</b> · {% endif %}{{ q.label }}</span></button>
             {% endfor %}
             <div class="xs muted row" style="gap:10px;padding:10px 9px 2px"><span class="row" style="gap:4px"><span class="dot primary"></span>converted</span>
               <span class="row" style="gap:4px"><span class="dot ok"></span>tested</span><span class="row" style="gap:4px"><span class="dot bad"></span>failed</span></div>
           </div>
           <div>
-          {% for q in p.queries %}{% set st = status[p.slug][q.target] %}
-            <div class="qpanel {{ 'active' if loop.first }}" role="tabpanel" data-panel="{{ q.target }}" style="padding:0">
+          {% for q in p.queries %}{% set st = status[p.slug][q.target] if not q.client else 'not-tested' %}
+            <div class="qpanel {{ 'active' if loop.first }}" role="tabpanel" data-panel="{{ q.client }}:{{ q.target }}" style="padding:0">
               <div class="code">
-                <div class="code-bar"><span class="title">{{ q.label }}</span>
+                <div class="code-bar"><span class="title">{% if q.client %}{{ q.client }} · {% endif %}{{ q.label }}</span>
                   {{ ui.status(st) }}
-                  {% if q.method and q.method != "pysigma" %}<span class="badge sq warn" title="Translated by the model; no deterministic backend">AI-translated (unverified)</span>{% endif %}
+                  {% if q.method == "llm" %}<span class="badge sq warn" title="Translated by the model; no deterministic backend">AI-translated (unverified)</span>
+                  {% elif q.method == "template" %}<span class="badge sq" title="Generated by ti2dac code (Wazuh XML, threshold or join template), not by the AI">ti2dac template</span>{% endif %}
                   <span class="spacer"></span>{% if q.query %}{{ ui.copy_btn() }}{% endif %}</div>
                 {% if q.query %}<pre>{{ q.query }}</pre>
                 {% else %}<div class="alert bad">{{ ui.icon("x") }}<div><div class="alert-title">Conversion failed</div><code style="background:none;padding:0">{{ q.error }}</code></div></div>{% endif %}
@@ -263,15 +264,18 @@
 
       {% if p.field_mappings %}
       <div role="tabpanel" data-panel="mapping" style="padding:12px 0 8px">
-        {% set tids = p.queries|selectattr("method", "equalto", "pysigma")|map(attribute="target")|list %}
         <p class="xs muted" style="padding:0 20px">How each Sigma field is named in each SIEM. <span class="bad">Red</span> cells are not supported by that backend.</p>
+        {% for cl in p.field_mappings|map(attribute="client")|unique %}
+        {% set tids = p.queries|selectattr("client", "equalto", cl)|rejectattr("method", "equalto", "llm")|map(attribute="target")|list %}
+        {% if cl %}<p class="xs" style="padding:12px 20px 0;margin:0"><b>Client {{ cl }}</b> (its profile's field names)</p>{% endif %}
         <div class="table-wrap"><table class="table compact">
           <thead><tr><th>Sigma field</th>{% for t in tids %}<th>{{ t }}</th>{% endfor %}</tr></thead>
-          <tbody>{% for fm in p.field_mappings %}<tr><td><code>{{ fm.sigma_field }}</code></td>
+          <tbody>{% for fm in p.field_mappings if fm.client == cl %}<tr><td><code>{{ fm.sigma_field }}</code></td>
             {% for t in tids %}{% set v = fm.targets.get(t, "") %}
               {% if v.startswith('UNSUPPORTED') %}<td class="bad" title="{{ v }}">unsupported</td>{% else %}<td class="mono" style="font-size:12px">{{ v }}</td>{% endif %}
             {% endfor %}</tr>{% endfor %}</tbody>
         </table></div>
+        {% endfor %}
       </div>{% endif %}
 
       <div role="tabpanel" data-panel="simulation">
@@ -364,6 +368,33 @@
     </form>
   </section>
   {% endfor %}
+
+  {% if r.chains %}
+  <section class="card" id="chains" aria-labelledby="ch-title">
+    <div class="card-head"><div><h2 id="ch-title">{{ ui.icon("layers") }}Multi-event chains</h2>
+      <p class="desc">Rules above joined into one detection by ti2dac code (Sigma correlation plus fixed query templates). The AI never writes the join.
+        Add one with <code>ti2dac chain {{ r.run_id }} rule-001 rule-002 --within 10m --on host</code>.</p></div></div>
+    <div class="card-body stack">
+    {% for c in r.chains %}
+      <details class="plain" {{ 'open' if loop.first }}>
+        <summary>{{ ui.icon("chevron-right", "sm chev") }}<b>{{ c.slug }}</b>&nbsp;{{ c.name }}
+          <span class="xs muted">&nbsp;· {{ c.steps|join(" → ") }}{% if not c.ordered %} (any order){% endif %} · same {{ c.join_on.replace("_", " ") }} · within {{ c.within }}
+          · {{ c.queries|selectattr("query")|list|length }}/{{ c.queries|length }} queries · {{ "from the analysis" if c.source == "analysis" else "analyst" }}</span></summary>
+        {% if c.evidence %}<blockquote class="xs muted" style="margin:10px 0">{{ c.evidence }}</blockquote>{% endif %}
+        {% if c.warnings %}<ul class="xs">{% for w in c.warnings %}<li>{{ w }}</li>{% endfor %}</ul>{% endif %}
+        {% for q in c.queries %}
+        <div class="code" style="margin-top:10px">
+          <div class="code-bar"><span class="title">{% if q.client %}{{ q.client }} · {% endif %}{{ q.label }}</span>
+            {% if q.method == "template" %}<span class="badge sq">ti2dac template</span>{% endif %}<span class="spacer"></span>{% if q.query %}{{ ui.copy_btn() }}{% endif %}</div>
+          {% if q.query %}<pre>{{ q.query }}</pre>{% else %}<p class="xs muted" style="padding:8px 12px;margin:0">Not available: {{ q.error }}</p>{% endif %}
+        </div>
+        {% if q.notes and q.query %}<p class="xs muted" style="margin:6px 0 0">{{ q.notes }}</p>{% endif %}
+        {% endfor %}
+      </details>
+    {% endfor %}
+    </div>
+  </section>
+  {% endif %}
 </div>
 
 <aside class="rail" aria-label="On this page">
@@ -373,6 +404,7 @@
   {% if r.packages %}<div class="group"><div class="section-title">Rules</div>
   {% for p in r.packages %}<a href="#{{ p.slug }}" title="{{ p.draft.sigma.title }}"><span class="dot {{ ui.tone(p.review_status) }}"></span><span class="t">{{ p.draft.sigma.title }}</span></a>{% endfor %}
   </div>{% endif %}
+  {% if r.chains %}<a href="#chains">{{ ui.icon("layers", "sm") }}<span class="t">Multi-event chains ({{ r.chains|length }})</span></a>{% endif %}
 </aside>
 </div>
 {% endblock %}

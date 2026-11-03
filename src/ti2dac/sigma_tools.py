@@ -2,14 +2,34 @@
 from __future__ import annotations
 
 import re
+import threading
 import uuid
 import warnings
 from datetime import date
 
+import pyparsing
 import yaml
+from sigma import conditions as _sigma_conditions
 
+from . import correlate
 from .models import FieldMapping, QueryResult, SigmaDraft
 from .targets import TARGETS, make_backend, plugins
+
+# Sigma conditions are parsed with pyparsing; without its packrat cache every field probe re-parses the
+# condition grammar from scratch (about 8x slower per rule). The cache is global and not thread-safe, and
+# rules are generated in parallel, so condition parsing is serialized (it is CPU-bound under the GIL anyway).
+pyparsing.ParserElement.enable_packrat()
+_PARSE_LOCK = threading.RLock()
+
+
+def _serialized(parse):
+    def locked(self, *a, **kw):
+        with _PARSE_LOCK:
+            return parse(self, *a, **kw)
+    return locked
+
+
+_sigma_conditions.SigmaCondition.parse = _serialized(_sigma_conditions.SigmaCondition.parse)
 
 RULE_NAMESPACE = uuid.UUID("5b1f3c2e-8a0d-4f6e-9c3a-7d2b1e0f4a91")
 
@@ -251,18 +271,25 @@ def apply_index_override(target: str, query: str, value: str) -> str:
     return query
 
 
-def convert(rule_yaml: str, target_ids: list[str], index_overrides: dict[str, str] | None = None) -> list[QueryResult]:
+def convert(rule_yaml: str, target_ids: list[str], index_overrides: dict[str, str] | None = None,
+            client=None) -> list[QueryResult]:
+    """Deterministic queries. A correlation the backend cannot convert gets ti2dac's threshold template
+    (correlate.py) around the converted base rule; correlation logic is never left to the AI."""
     from sigma.collection import SigmaCollection
 
     product = _product(rule_yaml)
+    docs = load_docs(rule_yaml)
+    corr = correlate.parse(docs)
     results = []
     for tid in target_ids:
         t = TARGETS.get(tid)
         if t is None:
             continue
-        res = QueryResult(target=tid, label=t.label, language=t.language, method="pysigma", notes=t.notes)
+        res = QueryResult(target=tid, label=t.label, language=t.language, notes=t.notes,
+                          method="template" if t.backend.startswith("ti2dac_") else "pysigma",
+                          client=client.name if client is not None else "")
         try:
-            backend = make_backend(t, product)
+            backend = make_backend(t, product, client)
             # Some backends only *warn* when they drop part of the rule (e.g. QRadar removes conditions it
             # cannot map), which silently broadens the query. Surface those warnings on the query.
             with warnings.catch_warnings(record=True) as caught:
@@ -280,13 +307,35 @@ def convert(rule_yaml: str, target_ids: list[str], index_overrides: dict[str, st
         except Exception as e:
             res.error = _short_error(e)
             res.validation = "failed"
+            if corr is not None:
+                _threshold_fallback(res, docs, corr, client, (index_overrides or {}).get(tid, ""))
         results.append(res)
     return results
 
 
+def _threshold_fallback(res: QueryResult, docs: list[dict], corr: dict, client, index_override: str) -> None:
+    base_doc = {k: v for k, v in docs[0].items() if k != "name"}
+    (base,) = convert(dump_docs([base_doc]), [res.target], None, client)
+    if not base.query:
+        res.error = f"correlation: the base rule does not convert ({base.error})"
+        return
+    mapped = {f: map_field(base_doc, f, res.target, client) for f in [*corr["group_by"], corr["field"]] if f}
+    try:
+        query, note = correlate.threshold_query(res.target, base.query, corr, mapped)
+    except ValueError as e:
+        res.error = f"correlation not expressible for {res.target}: {e}. Not sent to the AI: thresholds are only " \
+                    "built by code"
+        return
+    res.query, res.error, res.validation, res.method = apply_index_override(res.target, query, index_override), None, \
+        "not-tested", "template"
+    res.notes = f"{res.notes} {note}".strip()
+
+
 def _short_error(e: Exception) -> str:
     msg = str(e).split("\n")[0]
-    msg = re.sub(r"(\b[^.]{20,}\.)\s*\1", r"\1", msg)          # some backends repeat the sentence
+    sentences = [x.strip() for x in re.split(r"(?<=\.)\s+", msg)]   # some backends repeat the sentence
+    msg = " ".join(x for i, x in enumerate(sentences) if x.rstrip(".") not in (y.rstrip(".") for y in sentences[:i]))
+    msg = re.sub(r"(?<=\.)\s[^.]*:$", "", msg)                      # drop a dangling "... in this order:" lead-in
     msg = re.sub(r"\s*\(while (converting|applying)[^)]*\)", "", msg)
     return f"{type(e).__name__}: {msg}"[:300]
 
@@ -324,31 +373,35 @@ def rule_fields(rule_yaml: str) -> list[str]:
     return list(out)
 
 
-def field_mappings(rule_yaml: str, target_ids: list[str]) -> list[FieldMapping]:
-    """Probe each field through each target's pipeline to show the real mapped field name."""
+def map_field(base_doc: dict, field: str, tid: str, client=None) -> str:
+    """The name `field` gets in target `tid` (through the client's mapping, if any), or 'UNSUPPORTED: reason'.
+
+    The field is probed inside a copy of the rule: some backends pick the table from the rule's other
+    conditions (e.g. Kusto from the EventID), so a field probed alone would look unsupported."""
     from sigma.collection import SigmaCollection
 
-    data = first_doc(rule_yaml)
-    logsource = data.get("logsource", {})
-    product = logsource.get("product", "")
-    rows = []
-    for f in rule_fields(rule_yaml):
-        probe = yaml.safe_dump({
-            "title": "probe", "logsource": logsource,
-            "detection": {"sel": {f: "ZZPROBEZZ"}, "condition": "sel"},
-        })
-        mapped: dict[str, str] = {}
-        for tid in target_ids:
-            t = TARGETS.get(tid)
-            if t is None:
-                continue
-            try:
-                col = SigmaCollection.from_yaml(probe)
-                make_backend(t, product).convert(col)
-                names = [it.field for d in col.rules[0].detection.detections.values() for it in _walk(d)
-                         if any("ZZPROBEZZ" in str(v) for v in it.value)]
-                mapped[tid] = ", ".join(dict.fromkeys(n for n in names if n)) or f
-            except Exception as e:
-                mapped[tid] = "UNSUPPORTED: " + _short_error(e).split(": ", 1)[-1][:140]
-        rows.append(FieldMapping(sigma_field=f, targets=mapped))
-    return rows
+    t = TARGETS.get(tid)
+    if t is None:
+        return "UNSUPPORTED: unknown target"
+    logsource = base_doc.get("logsource") or {}
+    det = dict(base_doc.get("detection") or {})
+    cond = det.pop("condition", "")
+    det["ti2dac_probe"] = {field: "ZZPROBEZZ"}
+    probe = yaml.safe_dump({"title": "probe", "logsource": logsource,
+                            "detection": {**det, "condition": f"({cond}) and ti2dac_probe" if cond else "ti2dac_probe"}})
+    try:
+        col = SigmaCollection.from_yaml(probe)
+        make_backend(t, logsource.get("product", ""), client).convert(col)
+        names = [it.field for d in col.rules[0].detection.detections.values() for it in _walk(d)
+                 if any("ZZPROBEZZ" in str(v) for v in it.value)]
+        return ", ".join(dict.fromkeys(n for n in names if n)) or field
+    except Exception as e:
+        return "UNSUPPORTED: " + _short_error(e).split(": ", 1)[-1][:140]
+
+
+def field_mappings(rule_yaml: str, target_ids: list[str], client=None) -> list[FieldMapping]:
+    """Probe each field through each target's pipeline to show the real mapped field name."""
+    doc = first_doc(rule_yaml)
+    return [FieldMapping(sigma_field=f, client=client.name if client is not None else "",
+                         targets={tid: map_field(doc, f, tid, client) for tid in target_ids if tid in TARGETS})
+            for f in rule_fields(rule_yaml)]

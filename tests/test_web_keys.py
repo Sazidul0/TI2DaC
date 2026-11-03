@@ -21,6 +21,7 @@ def _client(settings, tmp_path, monkeypatch, ok=True):
         monkeypatch.delenv(var, raising=False)   # also restores whatever the test sets
     checked = []
     monkeypatch.setattr(web, "verify_key", lambda p, k: (checked.append((p, k)) or (ok, "checked")))
+    monkeypatch.setattr(web.modelchoice, "refresh", lambda s, p: (False, "offline"))   # no model-list call
     return TestClient(web.create_app(settings)), env, checked
 
 
@@ -78,3 +79,22 @@ def test_api_reference(settings, tmp_path, monkeypatch):
     assert client.get("/api/docs", follow_redirects=False).headers["location"] == "/api"
     paths = client.get("/openapi.json").json()["paths"]
     assert "/api/jobs/{jid}" in paths and "/" not in paths and "/ai" not in paths, "HTML pages stay out of the API schema"
+
+
+def test_working_key_for_the_only_keyed_provider_becomes_active(settings, tmp_path, monkeypatch):
+    client, _, _ = _client(settings, tmp_path, monkeypatch)
+    monkeypatch.setattr(aistatus.Path, "home", lambda: tmp_path)   # no `ant auth login` profile
+    assert client.get("/api/ai-status").json()["provider"] == "anthropic"
+    client.post("/ai/key", data={"provider": "gemini", "action": "save", "key": "AIza" + "y" * 35})
+    assert client.get("/api/ai-status").json()["provider"] == "gemini", "Claude has no key, so Gemini takes over"
+    assert "is now the active provider, because Claude (Anthropic) has no key" in client.get("/ai").text
+
+    client.post("/ai/key", data={"provider": "anthropic", "action": "save", "key": KEY})
+    assert client.get("/api/ai-status").json()["provider"] == "gemini", "an active provider with a key is never switched"
+
+
+def test_failed_key_check_does_not_switch_provider(settings, tmp_path, monkeypatch):
+    client, _, _ = _client(settings, tmp_path, monkeypatch, ok=False)
+    monkeypatch.setattr(aistatus.Path, "home", lambda: tmp_path)
+    client.post("/ai/key", data={"provider": "gemini", "action": "save", "key": "AIza" + "y" * 35})
+    assert client.get("/api/ai-status").json()["provider"] == "anthropic"
