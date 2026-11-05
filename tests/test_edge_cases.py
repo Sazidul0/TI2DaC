@@ -123,6 +123,17 @@ def test_non_english_report_is_flagged():
     assert not pipeline.looks_english("Der Angreifer führte PowerShell auf dem Host aus und erstellte eine Aufgabe. " * 10)
 
 
+def test_condense_survives_long_hex_runs():
+    """A hash followed by text once backtracked exponentially in the hex-dump filter and froze the web server."""
+    from ti2dac.condense import condense
+
+    text = ("The loader decrypts the payload with RC4.\n\n"
+            "ab2637c544b708fa67951cef5b59ea09e0698f6d8d0ae958ba04e77d6e8a08bb06e437d00e... (88 bytes)\n\n"
+            "4d 5a 90 00 03 00 00 00 04 00 00 00 ff ff 00 00\n\nIt then runs schtasks /create.")
+    out = condense(text, 4000).text
+    assert "schtasks" in out and "4d 5a 90" not in out
+
+
 # --------------------------------------------------------------------------- governance
 def test_four_eyes_and_roles_in_web(settings, report_file, monkeypatch):
     from ti2dac.users import Users

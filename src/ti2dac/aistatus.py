@@ -17,14 +17,14 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from .locks import file_lock
 
 BLOCKING = {"rate_limited", "quota_exhausted", "daily_cap", "auth_error"}
 DAILY_COUNTERS = ("requests_today", "input_tokens_today", "output_tokens_today", "cache_read_tokens_today", "cost_today_usd")
 TOTAL_COUNTERS = ("input_tokens_total", "output_tokens_total", "cost_total_usd")
-_LOCK = threading.Lock()
 
 
 def _now() -> datetime:
@@ -33,6 +33,11 @@ def _now() -> datetime:
 
 def _path(state_dir: str | Path) -> Path:
     return Path(state_dir) / "ai_status.json"
+
+
+def _locked(state_dir: str | Path):
+    """Read-modify-write of ai_status.json: the server, its job workers and the CLI all count requests."""
+    return file_lock(Path(state_dir) / "ai_status.lock")
 
 
 def load(state_dir: str | Path) -> dict:
@@ -61,7 +66,7 @@ def provider_status(state_dir: str | Path, provider: str) -> dict:
 
 
 def update(state_dir: str | Path, provider: str, **fields) -> dict:
-    with _LOCK:
+    with _locked(state_dir):
         data = load(state_dir)
         cur = provider_status(state_dir, provider) if provider in data else {
             "day": datetime.now().date().isoformat(), "requests_today": 0}
@@ -73,7 +78,7 @@ def update(state_dir: str | Path, provider: str, **fields) -> dict:
 
 
 def count_request(state_dir: str | Path, provider: str) -> int:
-    with _LOCK:
+    with _locked(state_dir):
         data = load(state_dir)
         cur = provider_status(state_dir, provider)
         cur["requests_today"] = int(cur.get("requests_today", 0)) + 1
@@ -85,7 +90,7 @@ def count_request(state_dir: str | Path, provider: str) -> int:
 def add_usage(state_dir: str | Path, provider: str, input_tokens: int, output_tokens: int,
               cache_read_tokens: int, cost_usd: float) -> None:
     """Token accounting per provider: today (resets at local midnight) and since the state dir was created."""
-    with _LOCK:
+    with _locked(state_dir):
         data = load(state_dir)
         cur = provider_status(state_dir, provider)
         for key, val in (("input_tokens", input_tokens), ("output_tokens", output_tokens)):
@@ -108,7 +113,7 @@ def record_block(state_dir: str | Path, provider: str, state: str, message: str,
 
 
 def reset(state_dir: str | Path, provider: str | None = None) -> None:
-    with _LOCK:
+    with _locked(state_dir):
         data = load(state_dir)
         for name in ([provider] if provider else list(data)):
             if name in data:

@@ -6,7 +6,7 @@ from pathlib import Path
 import yaml
 from fastapi.testclient import TestClient
 
-from ti2dac import pipeline
+from ti2dac import pipeline, redact
 from ti2dac.feedback import Store
 from ti2dac.ingest import load_report
 from ti2dac.render import load_record, render
@@ -118,7 +118,7 @@ def test_feedback_correction_versioning_and_lessons(settings, report_file, monke
     assert new.version == 2 and new.history[0]["version"] == "1" and new.rule_id == pkg.rule_id
     assert "AgentExecutor" in next(q.query for q in new.queries if q.target == "splunk")
     store.resolve_feedback(fid, "applied", "v2", "alice")
-    store.add_lesson(store.get_feedback(fid), "T1053.005", "windows", "process_creation")
+    store.add_lesson(store.get_feedback(fid), "T1053.005", "windows", "process_creation", tlp="clear")
 
     # an invalid correction is refused and leaves v2 in place
     bad = yaml.safe_load(new.rule_yaml)
@@ -131,14 +131,14 @@ def test_feedback_correction_versioning_and_lessons(settings, report_file, monke
     assert next(p for p in record.packages if p.slug == pkg.slug).version == 2
 
     # the applied feedback is now a lesson for this technique (prompt injection is tested below)
-    assert store.relevant_lessons("T1053.005", "windows", "", 5)[0].startswith("[sigma_rule/too_broad_fp]")
-    assert store.relevant_lessons("T1053", "windows", "", 5), "parent technique should match sub-technique lessons"
+    assert store.relevant_lessons("T1053.005", "windows", "", 5, ["clear"])[0].startswith("[sigma_rule/too_broad_fp]")
+    assert store.relevant_lessons("T1053", "windows", "", 5, ["clear"]), "parent technique should match sub-technique lessons"
 
 
 def test_lessons_reach_prompt(settings, report_file, monkeypatch):
     store = Store(settings.db_path)
     store.add_lesson({"id": 1, "artifact": "sigma_rule", "category": "wrong_field_name", "comment": "Use OriginalFileName too", "target": ""},
-                     "T1053.005", "windows", "process_creation")
+                     "T1053.005", "windows", "process_creation", tlp="clear")
     _, _, _, fake = _run(settings, report_file, monkeypatch)
     prompt = next(u for s, u in fake.calls if s == "generate" and "T1053.005" in u)
     assert "Use OriginalFileName too" in prompt and "<feedback>" in prompt
@@ -288,13 +288,33 @@ def test_logsource_lessons_reach_prompt(settings, report_file, monkeypatch):
     # a lesson from a different technique on the same log source (process_creation) must still be injected
     store = Store(settings.db_path)
     store.add_lesson({"id": 1, "artifact": "sigma_rule", "category": "too_broad_fp", "comment": "Exclude CCM parent", "target": ""},
-                     "T1218.011", "windows", "process_creation")
+                     "T1218.011", "windows", "process_creation", tlp="clear")
     store.add_lesson({"id": 2, "artifact": "sigma_rule", "category": "other", "comment": "   ", "target": ""},
-                     "T1053.005", "windows", "process_creation")
+                     "T1053.005", "windows", "process_creation", tlp="clear")
     assert len(store.list_lessons()) == 1, "a feedback without a comment carries no lesson"
     _, _, _, fake = _run(settings, report_file, monkeypatch)
     prompt = next(u for s, u in fake.calls if s == "generate" and "T1053.005" in u)
     assert "Exclude CCM parent" in prompt
+
+
+def test_lessons_never_exceed_the_runs_tlp(settings, report_file, monkeypatch):
+    # a comment on a TLP:RED run may quote that report; it must not reach the prompt of a TLP:CLEAR run
+    store = Store(settings.db_path)
+    fb = {"artifact": "sigma_rule", "category": "too_broad_fp", "target": ""}
+    store.add_lesson({**fb, "id": 1, "comment": "Exclude the RED-only host"}, "T1053.005", "windows", "process_creation",
+                     tlp="red")
+    store.add_lesson({**fb, "id": 2, "comment": "Exclude CCM parent"}, "T1053.005", "windows", "process_creation",
+                     tlp="clear")
+    with store._conn() as c:   # a lesson from before lessons carried TLP
+        c.execute("INSERT INTO lessons(feedback_id, technique_id, product, category, artifact, text) "
+                  "VALUES (3, 'T1053.005', 'windows', 'process_creation', 'sigma_rule', 'unmarked lesson')")
+    assert redact.lesson_tlps("amber", ["clear", "green", "amber", "red"]) == ["clear", "green", "amber"]
+    assert redact.lesson_tlps("red", ["clear", "green"]) == ["clear", "green"]
+    assert redact.lesson_tlps("", ["clear"]) == []
+    _, _, _, fake = _run(settings, report_file, monkeypatch)
+    prompt = next(u for s, u in fake.calls if s == "generate" and "T1053.005" in u)
+    assert "Exclude CCM parent" in prompt
+    assert "RED-only" not in prompt and "unmarked lesson" not in prompt
 
 
 def test_web_feedback_loop(settings, report_file, monkeypatch):

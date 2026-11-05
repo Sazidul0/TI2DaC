@@ -491,7 +491,8 @@ def feedback_add(run_id: str, slug: str,
         fb = store.get_feedback(fid)
         store.resolve_feedback(fid, "applied", f"rule {slug} -> v{new.version}", reviewer)
         store.add_lesson(fb, new.behaviour.technique_id, new.draft.sigma.logsource.product,
-                         new.draft.sigma.logsource.category or new.draft.sigma.logsource.service)
+                         new.draft.sigma.logsource.category or new.draft.sigma.logsource.service,
+                         tlp=record.report.tlp_effective)
         _rerender(record, path)
         typer.echo(f"applied: {slug} is now v{new.version} (review status reset to draft)")
 
@@ -533,7 +534,8 @@ def feedback_apply(fid: int, ai: bool = typer.Option(False, "--ai", help="Let th
         _fail(str(e))
     store.resolve_feedback(fid, "applied", f"{fb['slug']} -> v{new.version}{' (AI)' if ai and not correction else ''}", reviewer)
     store.add_lesson(fb, new.behaviour.technique_id, new.draft.sigma.logsource.product,
-                     new.draft.sigma.logsource.category or new.draft.sigma.logsource.service)
+                     new.draft.sigma.logsource.category or new.draft.sigma.logsource.service,
+                     tlp=record.report.tlp_effective)
     _rerender(record, path)
     typer.echo(f"applied #{fid}: {fb['slug']} is now v{new.version}; review it before approving.\n")
     typer.echo(new.rule_yaml)
@@ -552,7 +554,8 @@ def feedback_resolve(fid: int, status: str = typer.Option(..., help="applied|rej
     if lesson:
         record = load_record(_run_dir(fb["run_id"]))
         p = next(p for p in record.packages if p.slug == fb["slug"])
-        store.add_lesson(fb, p.behaviour.technique_id, p.draft.sigma.logsource.product, p.draft.sigma.logsource.category)
+        store.add_lesson(fb, p.behaviour.technique_id, p.draft.sigma.logsource.product, p.draft.sigma.logsource.category,
+                         tlp=record.report.tlp_effective)
     typer.echo(f"#{fid} -> {status}")
 
 

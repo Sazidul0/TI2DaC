@@ -13,10 +13,14 @@ import re
 import socket
 import time
 import unicodedata
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
+from urllib.request import getproxies, proxy_bypass
 
 import httpx
 
@@ -41,6 +45,16 @@ class LoadedReport:
 # Zero-width / bidi / control characters are a common carrier for hidden prompt-injection text.
 _INVISIBLE = re.compile(r"[​-‏‪-‮⁠-⁤﻿­]")
 _CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+# Hostile documents: a few hundred KB can expand to GBs (zip bomb) or take hours to parse (pypdf ~5s/page).
+_DOCX_MAX_UNZIPPED = 100 * 1024 * 1024    # all parts, images included
+_DOCX_MAX_XML = 16 * 1024 * 1024           # parsed into an lxml tree at ~25x its size
+_PDF_MAX_PAGES = 500
+_PDF_BUDGET_S = 120.0
+# A slow-drip server resets the per-read timeout forever; the whole download gets this many timeouts.
+_FETCH_TOTAL_FACTOR = 4
+_DNS_TIMEOUT_S = 10.0
 
 
 def normalize_text(text: str) -> str:
@@ -96,7 +110,12 @@ def _pdf_to_text(raw: bytes) -> tuple[str, dict[str, str]]:
     except Exception as e:
         raise IngestError(f"malformed PDF: {e}") from e
     pages = []
+    total, deadline = len(reader.pages), time.monotonic() + _PDF_BUDGET_S
     for i, page in enumerate(reader.pages, 1):
+        if i > _PDF_MAX_PAGES or time.monotonic() > deadline:   # keep what was extracted
+            why = f"{_PDF_MAX_PAGES}-page limit" if i > _PDF_MAX_PAGES else f"{_PDF_BUDGET_S:.0f}s time limit"
+            pages.append(f"[text extraction stopped at page {i - 1} of {total}: {why}]")
+            break
         try:
             pages.append(f"[page {i}]\n{page.extract_text() or ''}")
         except Exception:
@@ -112,6 +131,16 @@ def _docx_to_text(raw: bytes) -> tuple[str, dict[str, str]]:
     from docx.table import Table
     from docx.text.paragraph import Paragraph
 
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:   # zipfile never inflates a member past its declared size
+            parts = zf.infolist()
+    except (zipfile.BadZipFile, ValueError) as e:
+        raise IngestError(f"malformed DOCX: {e}") from e
+    unzipped = sum(i.file_size for i in parts)
+    xml = sum(i.file_size for i in parts if i.filename.endswith((".xml", ".rels")))
+    if unzipped > _DOCX_MAX_UNZIPPED or xml > _DOCX_MAX_XML:
+        raise IngestError(f"DOCX expands to {unzipped // 2**20} MB ({xml // 2**20} MB of XML) uncompressed; limits are "
+                          f"{_DOCX_MAX_UNZIPPED // 2**20} MB and {_DOCX_MAX_XML // 2**20} MB of XML. Refusing a likely zip bomb.")
     try:
         doc = Document(io.BytesIO(raw))
     except Exception as e:
@@ -175,30 +204,58 @@ def _check_host(host: str, cfg: FetchConfig) -> None:
         raise IngestError(f"host {host!r} is not in fetch.allowed_domains")
     infos = None
     for attempt in range(2):   # one retry: transient resolver failures are common on busy hosts/VPNs
+        ex = ThreadPoolExecutor(1)   # getaddrinfo has no timeout of its own
         try:
-            infos = socket.getaddrinfo(host, None)
+            infos = ex.submit(socket.getaddrinfo, host, None).result(timeout=_DNS_TIMEOUT_S)
             break
+        except FuturesTimeout as e:
+            raise IngestError(f"cannot resolve {host}: timed out after {_DNS_TIMEOUT_S:.0f}s") from e
         except socket.gaierror as e:
             if attempt:
                 raise IngestError(f"cannot resolve {host}: {e}") from e
             time.sleep(1.5)
+        finally:
+            ex.shutdown(wait=False)
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if not ip.is_global or ip.is_multicast:
-            raise IngestError(f"refusing to fetch {host}: resolves to non-public address {ip}")
+        _check_ip(info[4][0], host)
+
+
+def _check_ip(addr: str, host: str) -> None:
+    ip = ipaddress.ip_address(addr.split("%", 1)[0])   # strip an IPv6 zone id
+    if not ip.is_global or ip.is_multicast:
+        raise IngestError(f"refusing to fetch {host}: resolves to non-public address {ip}")
+
+
+def _proxied(url: str) -> bool:
+    """httpx honours *_PROXY env vars; the TCP peer is then the proxy, not the report host."""
+    p, host = getproxies(), urlparse(url).hostname or ""
+    return bool(p.get(urlparse(url).scheme) or p.get("all")) and not proxy_bypass(host)
 
 
 def fetch_url(url: str, cfg: FetchConfig) -> tuple[bytes, str, str]:
     if not cfg.allow_urls:
         raise IngestError("URL ingestion disabled by configuration")
     headers = {"User-Agent": "ti2dac/0.1 (+threat-intel-to-detection; research use)"}
+    deadline = time.monotonic() + cfg.timeout_s * _FETCH_TOTAL_FACTOR
+
+    def overdue() -> None:
+        if time.monotonic() > deadline:
+            raise IngestError(f"download of {url} took longer than {cfg.timeout_s * _FETCH_TOTAL_FACTOR:.0f}s")
+
     with httpx.Client(follow_redirects=False, timeout=cfg.timeout_s, headers=headers) as client:
         for _ in range(6):
+            overdue()
             p = urlparse(url)
             if p.scheme not in ("http", "https") or not p.hostname:
                 raise IngestError(f"unsupported URL: {url}")
             _check_host(p.hostname, cfg)
-            with client.stream("GET", url) as r:
+
+            def trace(event: str, info: dict, host: str = p.hostname, direct: bool = not _proxied(url)) -> None:
+                # DNS rebinding: httpx resolves again, so check the address actually connected to before sending
+                if direct and event == "connection.connect_tcp.complete":
+                    _check_ip(info["return_value"].get_extra_info("server_addr")[0], host)
+
+            with client.stream("GET", url, extensions={"trace": trace}) as r:
                 if r.is_redirect:
                     url = urljoin(url, r.headers.get("location", ""))
                     continue
@@ -209,6 +266,7 @@ def fetch_url(url: str, cfg: FetchConfig) -> tuple[bytes, str, str]:
                     buf.extend(chunk)
                     if len(buf) > cfg.max_bytes:
                         raise IngestError(f"report exceeds {cfg.max_bytes} bytes")
+                    overdue()
                 return bytes(buf), r.headers.get("content-type", ""), url
     raise IngestError("too many redirects")
 

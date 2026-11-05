@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS test_results (
   rule_version INTEGER, target TEXT, result TEXT, fp_count INTEGER, evidence TEXT, environment TEXT);
 CREATE TABLE IF NOT EXISTS lessons (
   id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, feedback_id INTEGER, technique_id TEXT,
-  product TEXT, category TEXT, artifact TEXT, text TEXT, active INTEGER DEFAULT 1);
+  product TEXT, category TEXT, artifact TEXT, text TEXT, active INTEGER DEFAULT 1, tlp TEXT);
 CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, actor TEXT, action TEXT, details TEXT);
 CREATE TABLE IF NOT EXISTS jobs (
@@ -87,6 +87,8 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            if "tlp" not in {r["name"] for r in c.execute("PRAGMA table_info(lessons)")}:
+                c.execute("ALTER TABLE lessons ADD COLUMN tlp TEXT")   # databases from before lessons carried TLP
 
     @contextmanager
     def _conn(self):
@@ -191,32 +193,40 @@ class Store:
         self.audit(actor, "feedback.resolve", {"id": fid, "status": status, "resolution": resolution})
 
     # ------------------------------------------------------------------ lessons
-    def add_lesson(self, feedback: dict, technique_id: str, product: str, category: str) -> None:
+    def add_lesson(self, feedback: dict, technique_id: str, product: str, category: str, *, tlp: str) -> None:
+        """`tlp`: the effective TLP of the feedback's run; the comment may quote that report."""
         if not (feedback.get("comment") or "").strip():
             return   # a bare corrected rule carries no reusable advice; the new version is the record
         text = f"[{feedback['artifact']}/{feedback['category']}] {feedback['comment']}".strip()
         if feedback.get("target"):
             text = f"({feedback['target']}) " + text
         with self._conn() as c:
-            c.execute("INSERT INTO lessons(created_at, feedback_id, technique_id, product, category, artifact, text)"
-                      " VALUES (?,?,?,?,?,?,?)",
-                      (_now(), feedback["id"], technique_id, product, category, feedback["artifact"], text[:280]))
+            c.execute("INSERT INTO lessons(created_at, feedback_id, technique_id, product, category, artifact, text, tlp)"
+                      " VALUES (?,?,?,?,?,?,?,?)",
+                      (_now(), feedback["id"], technique_id, product, category, feedback["artifact"], text[:280],
+                       tlp.lower()))
 
-    def relevant_lessons(self, technique_id: str, product: str, category: str | list[str], limit: int) -> list[str]:
+    def relevant_lessons(self, technique_id: str, product: str, category: str | list[str], limit: int,
+                         tlps: list[str]) -> list[str]:
         """Most specific first: same technique > same parent technique > same logsource.
 
         `category` may be a list: before generation the logsource is not chosen yet, so the caller
-        passes the categories the behaviour's observables point to."""
+        passes the categories the behaviour's observables point to. Only lessons marked with one of
+        `tlps` are returned (lessons without a marking predate it and are never sent)."""
+        if not tlps:
+            return []
         parent = technique_id.split(".")[0]
         cats = [x for x in ([category] if isinstance(category, str) else category) if x] or ["\x00"]
         ph = ",".join("?" * len(cats))
+        tph = ",".join("?" * len(tlps))
         with self._conn() as c:
             rows = c.execute(
                 "SELECT text, CASE WHEN technique_id=? THEN 3 WHEN technique_id LIKE ? THEN 2 "
                 f"WHEN product=? AND category IN ({ph}) THEN 1 ELSE 0 END AS score FROM lessons "
-                f"WHERE active=1 AND (technique_id=? OR technique_id LIKE ? OR (product=? AND category IN ({ph}))) "
+                f"WHERE active=1 AND tlp IN ({tph}) "
+                f"AND (technique_id=? OR technique_id LIKE ? OR (product=? AND category IN ({ph}))) "
                 "ORDER BY score DESC, id DESC LIMIT ?",
-                (technique_id, parent + "%", product, *cats, technique_id, parent + "%", product, *cats, limit),
+                (technique_id, parent + "%", product, *cats, *tlps, technique_id, parent + "%", product, *cats, limit),
             ).fetchall()
         return list(dict.fromkeys(r["text"] for r in rows))
 

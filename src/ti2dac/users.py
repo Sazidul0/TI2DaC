@@ -11,10 +11,17 @@ import hashlib
 import hmac
 import json
 import os
+import threading
+import time
 from pathlib import Path
 
 ROLES = ("analyst", "approver", "admin")
 _ITER = 310_000
+# Basic auth resends the password on every request (static files, 1.5s job polling); remembering recent
+# successful checks keeps PBKDF2 to about one per user per TTL. The key covers the stored hash, so a
+# password change or removal invalidates it.
+_OK_TTL_S = 300
+_OK_MAX = 256
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
@@ -35,6 +42,8 @@ def verify_password(password: str, stored: str) -> bool:
 class Users:
     def __init__(self, state_dir: str | Path):
         self.path = Path(state_dir) / "users.json"
+        self._ok: dict[bytes, float] = {}   # sha256(name, password, stored hash) -> expiry
+        self._ok_lock = threading.Lock()
 
     def _read(self) -> dict:
         return json.loads(self.path.read_text()) if self.path.is_file() else {}
@@ -74,4 +83,17 @@ class Users:
         if u is None:
             hash_password(password, b"\0" * 16)   # equalise timing for unknown users
             return None
-        return u["role"] if verify_password(password, u["hash"]) else None
+        key = hashlib.sha256("\0".join((name, password, u["hash"])).encode()).digest()
+        now = time.monotonic()
+        with self._ok_lock:
+            if self._ok.get(key, 0) > now:
+                return u["role"]
+        if not verify_password(password, u["hash"]):
+            return None
+        with self._ok_lock:
+            if len(self._ok) >= _OK_MAX:
+                self._ok = {k: t for k, t in self._ok.items() if t > now}
+                while len(self._ok) >= _OK_MAX:
+                    self._ok.pop(next(iter(self._ok)))   # oldest first
+            self._ok[key] = now + _OK_TTL_S
+        return u["role"]

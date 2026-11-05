@@ -156,6 +156,7 @@ def settings(tmp_path) -> Settings:
     s.state_dir = str(tmp_path / "state")
     s.output_dir = str(tmp_path / "out")
     s.ai.response_cache = False
+    s.jobs.isolation = "thread"   # tests patch the AI in this process; tests/test_job_workers.py covers workers
     return s
 
 

@@ -6,14 +6,16 @@ package can be re-rendered at any time (after feedback, tests, reviews) at zero 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import tempfile
 import uuid
 from pathlib import Path
 
 import yaml
 
-from . import attack, safety
+from . import attack, safety, wazuh
 from . import sigma_tools as st
 from .feedback import CATEGORIES, TEST_RESULTS, target_status
 from .models import ChainPackage, DetectionPackage, QueryResult, RunRecord, Usage
@@ -28,6 +30,21 @@ def _cell(s) -> str:
     return str(s).replace("|", "\\|").replace("\n", " ").strip()
 
 
+# Every character Python, PowerShell or bash may treat as a line end (plus other controls).
+_LINE_BREAKS = re.compile(r"[\x00-\x08\x0a-\x1f\x7f\x85\u2028\u2029]+")
+
+
+def _comment(s) -> str:
+    """Model/user text inside a generated comment line: a line break would turn the rest into code
+    (above the lab guard, unseen by the safety linter, which only checks the script body)."""
+    return _LINE_BREAKS.sub(" ", str(s))
+
+
+def _safe_filename(name: str | None) -> str:
+    name = _LINE_BREAKS.sub("_", Path(name or "").name)
+    return name if name.strip(". ") else "report.bin"
+
+
 def _kebab(s: str, n: int = 50) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:n] or "rule"
 
@@ -39,7 +56,15 @@ def rule_filename(p: DetectionPackage) -> str:
 def save_record(record: RunRecord, out: Path) -> Path:
     out.mkdir(parents=True, exist_ok=True)
     path = out / "run.json"
-    path.write_text(record.model_dump_json(indent=1))
+    # Atomic: readers (web pages, other jobs) never see a half-written record.
+    fd, tmp = tempfile.mkstemp(dir=out, prefix=".run.json.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(record.model_dump_json(indent=1))
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
     return path
 
 
@@ -93,8 +118,9 @@ def render(record: RunRecord, out: Path, *, raw: bytes | None = None, filename: 
     if raw is not None:
         src = out / "source"
         src.mkdir(exist_ok=True)
-        (src / (filename or "report.bin")).write_bytes(raw)
-        (src / "SHA256SUMS").write_text(f"{record.report.sha256}  {filename or 'report.bin'}\n")
+        name = _safe_filename(filename)   # "..", "." or "" would name the directory itself
+        (src / name).write_bytes(raw)
+        (src / "SHA256SUMS").write_text(f"{record.report.sha256}  {name}\n")
     if redaction_map:
         src = out / "source"
         src.mkdir(exist_ok=True)
@@ -113,6 +139,7 @@ def render(record: RunRecord, out: Path, *, raw: bytes | None = None, filename: 
         p.sim_lint = safety.lint_script(sim.simulate, sim.cleanup) + [
             f for f in safety.lint_script(sim.cleanup) if f.rule != "missing-cleanup"]
         p.sim_blocked = any(f.severity == "block" for f in p.sim_lint)
+    wazuh.resolve_slot_collisions(record.packages)
     save_record(record, out)
     (out / "iocs.json").write_text(record.iocs.model_dump_json(indent=1))
     _write_behaviours(record, out)
@@ -181,7 +208,7 @@ def _write_rule(p: DetectionPackage, out: Path) -> None:
         h.mkdir(exist_ok=True)
         for old in p.history:
             (h / f"{p.slug}.v{old['version']}.yml").write_text(
-                f"# superseded {old['replaced_at']}: {old['reason']}\n" + old["rule_yaml"])
+                f"# superseded {old['replaced_at']}: {_comment(old['reason'])}\n" + old["rule_yaml"])
 
 
 def _query_ext(q: QueryResult) -> str:
@@ -278,8 +305,8 @@ def _write_simulation(record: RunRecord, p: DetectionPackage, out: Path) -> None
     sim, tel, b = p.draft.simulation, p.draft.telemetry, p.behaviour
     ext = {"powershell": "ps1", "bash": "sh", "python": "py"}[sim.language]
     guard = safety.lab_guard(sim.language)
-    header = (f"# ti2dac {p.slug} | ATT&CK {b.technique_id} {b.technique_name} | rule {p.rule_id} v{p.version}\n"
-              f"# Expected telemetry: {'; '.join(f'{e.source} {e.event_id}' for e in sim.expected_events)}\n")
+    header = (_comment(f"# ti2dac {p.slug} | ATT&CK {b.technique_id} {b.technique_name} | rule {p.rule_id} v{p.version}") + "\n"
+              + _comment(f"# Expected telemetry: {'; '.join(f'{e.source} {e.event_id}' for e in sim.expected_events)}") + "\n")
     if p.sim_blocked:
         body = safety.blocked_stub(sim.language, p.sim_lint)
         cleanup = body

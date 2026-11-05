@@ -90,6 +90,13 @@ def _is_transport_error(e: Exception) -> bool:
     return isinstance(e, (OSError, TimeoutError)) or type(e).__module__.split(".")[0] in ("httpx", "httpcore", "httpx2")
 
 
+def _stream_error_type(e) -> str:
+    """Error type of an SSE `error` event: it arrives after the 200 response, so the status code says nothing."""
+    body = getattr(e, "body", None)
+    err = body.get("error") if isinstance(body, dict) else None
+    return str(err.get("type", "")) if isinstance(err, dict) else ""
+
+
 def _header_seconds(value: str | None) -> float | None:
     try:
         return float(value) if value else None
@@ -442,11 +449,17 @@ class LLM:
             self._gone[cfg.model] = e.message[:200]
             raise LLMError(f"{stage}: model {cfg.model} not found: {e.message}") from e
         except anthropic.APIStatusError as e:
-            if e.status_code >= 500:   # 500/529 overloaded, after the SDK's own retries
+            if e.status_code >= 500 or _stream_error_type(e) in ("overloaded_error", "api_error"):
+                # 500/529 overloaded after the SDK's own retries, or the same reported mid-stream
                 raise self._outage(stage, "anthropic", f"Anthropic API unavailable ({e.status_code}): {e.message}") from e
             raise LLMError(f"{stage}: API error {e.status_code}: {e.message}") from e
         except anthropic.APIConnectionError as e:   # includes APITimeoutError
             raise self._outage(stage, "anthropic", f"cannot reach the Anthropic API: {e}") from e
+        except Exception as e:
+            # The SDK only wraps errors of the initial request; a connection dropped mid-stream surfaces raw.
+            if not _is_transport_error(e):
+                raise
+            raise self._outage(stage, "anthropic", f"connection lost mid-response: {type(e).__name__}: {str(e)[:200]}") from e
 
         attempts, by_fallback = anthropic_attempts(msg, cfg.model)
         self._record(stage, "anthropic", attempts, by_fallback)

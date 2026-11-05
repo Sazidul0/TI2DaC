@@ -102,6 +102,15 @@ class HealthConfig:
 
 
 @dataclass
+class JobConfig:
+    # "process": each web job runs in its own worker process, so a runaway report cannot freeze or crash
+    # the UI and a job can be stopped. "thread": inside the server process (tests that patch the AI).
+    isolation: str = "process"
+    timeout_minutes: float = 180   # a web job running longer is stopped
+    memory_mb: int = 4096          # address-space cap of a job's worker process; 0 = none
+
+
+@dataclass
 class Settings:
     author: str = "SHL Detection Engineering (ti2dac)"
     output_dir: str = "output"
@@ -133,6 +142,7 @@ class Settings:
     redaction: RedactionConfig = field(default_factory=RedactionConfig)
     log: LogConfig = field(default_factory=LogConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
+    jobs: JobConfig = field(default_factory=JobConfig)
 
     @property
     def cache_dir(self) -> Path:

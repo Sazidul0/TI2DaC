@@ -349,7 +349,7 @@ Add a SIEM: install its pySigma backend and add a `Target` in `src/ti2dac/target
 
 1. **Report problems:** `ti2dac feedback add <run> rule-001 --artifact sigma_rule --category too_broad_fp --comment "..."`, or use the form on each rule in the web UI. Categories cover hallucinated evidence, wrong ATT&CK mapping, wrong logsource or field, logic error, false positives, false negatives, syntax, translation, unsafe simulation, simulation not triggering, incomplete cleanup and documentation.
 2. **Fix:** attach a corrected rule, which is validated and saved as **v2** (v1 is archived in `rules/history/`), or use `ti2dac feedback apply <id> --ai`. Every new version starts as a draft.
-3. **Learn:** applied feedback becomes a short *lesson*, stored per technique and log source. Up to 5 relevant lessons are added to future generation prompts. Manage them with `ti2dac lessons`.
+3. **Learn:** applied feedback becomes a short *lesson*, stored per technique and log source. Up to 5 relevant lessons are added to future generation prompts. A lesson keeps the TLP of the run it came from and only reaches runs of the same or a stricter TLP whose provider may receive it. Manage them with `ti2dac lessons`.
 4. **Record outcomes:** lab results and production alert dispositions (`fired`, `not_fired`, `quiet`, `false_positive`, `true_positive`, `benign_true_positive`) feed the validation matrix.
 5. **Approve:** `ti2dac review <run> rule-001 --status approved`. Only users with the approver role can approve. **Four-eyes:** the author of a version, whoever generated or corrected it, cannot approve it, and a version with no recorded author cannot be approved at all. Identity in the CLI is the logged-in OS account; there is no `--reviewer` flag to type someone else's name. In the web UI it is the login. Approval moves the Sigma status from `experimental` to `test`.
 6. **Audit and evaluate:** every action is in the audit log. `ti2dac feedback export` produces a JSONL regression set to run before changing models or prompts.
@@ -400,7 +400,7 @@ or keys (anything shaped like an API key is replaced with `[SECRET]`).
 | `ai.call` | every AI request: `stage`, `provider`, `model`, `served_by`, `outcome` (ok, cached, refused, outage, truncated, error, paused, rate_limited, quota_exhausted, auth_error), `latency_ms`, tokens, `cost_usd` | AI request and token/cost metrics |
 | `ai.failover`, `ai.schema_retry` | failover to the second provider; a corrective re-ask | provider outage alerts |
 | `run.finish`, `run.failed`, `rule.failed` | each pipeline run, with rule counts, tokens and cost | failed-run alerts |
-| `job.start`, `job.finish` | web background jobs, with status and duration | job monitoring |
+| `job.start`, `job.finish`, `job.stopped` | web background jobs, with status and duration; `job.stopped` when a job was stopped by a user, hit `jobs.timeout_minutes` or its worker died | job monitoring |
 | `audit` | every audit entry (`action`, `actor`, `details`), including `auth.failed` (wrong login), `access.denied` (role not allowed) and `csrf.refused` (cross-site request), at warning level | security monitoring |
 | `http.request` | every web request: method, path, status, user, client, duration | access log |
 | `cli.command` | each CLI command and the OS user | audit of operator actions |
@@ -414,6 +414,12 @@ check the database (`PRAGMA quick_check`), free disk space for the state and out
 the AI provider (no key, paused or down) and jobs running longer than `health.stuck_job_minutes`. Each check is
 ok, warn or fail; `/healthz` returns 503 and `ti2dac health` exits 1 when one fails. AI problems only warn, because
 everything except AI drafting keeps working.
+
+**Background jobs:** each web job (analysis, generating more rules, AI rewrite from feedback) runs in its own
+worker process (`jobs.isolation: process`). A report that makes the pipeline hang or run out of memory only stops
+that job: the UI keeps working, the job page has a **Stop job** button (for the user who started it, approvers and
+admins), and a job is stopped after `jobs.timeout_minutes` (default 180). Each worker is capped at `jobs.memory_mb`
+(default 4096). Workers log through the server, so their events carry the same `job_id` and `run_id`.
 
 ## Web UI
 

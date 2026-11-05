@@ -39,6 +39,12 @@
 
   <div class="form-actions">
     <a class="btn outline" href="/">{{ ui.icon("arrow-left", "sm") }}Back to runs</a>
+    {% if job.status == "running" and can_stop %}
+    <form method="post" action="/jobs/{{ job.id }}/stop" data-job-stop data-busy
+          data-confirm="Stop this job? Work it has not finished is discarded; AI calls already made are still billed.">
+      <button class="btn danger" type="submit"><span class="spin"></span><span class="ico-default">{{ ui.icon("x", "sm") }}</span>Stop job</button>
+    </form>
+    {% endif %}
     {% if job.run_id %}<a class="btn" href="/runs/{{ job.run_id }}">Open run{{ ui.icon("arrow-right", "sm") }}</a>{% endif %}
   </div>
 </div>

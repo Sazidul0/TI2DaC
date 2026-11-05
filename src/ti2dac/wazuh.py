@@ -88,14 +88,16 @@ class _Lit:
         self.field, self.patterns, self.neg = field_, patterns, neg
 
 
-def _pattern(value) -> str:
-    """One Sigma value -> PCRE2 pattern with Sigma's full-match, case-insensitive semantics."""
+def _pattern(value, anchored: bool = True) -> str:
+    """One Sigma value -> PCRE2 pattern with Sigma's full-match, case-insensitive semantics. Keywords
+    (`anchored=False`) are substring matches against the whole log line."""
     from sigma.types import SigmaExpansion, SigmaNumber, SigmaRegularExpression, SigmaString, SpecialChars
 
+    a, z = ("^", "$") if anchored else ("", "")
     if isinstance(value, SigmaExpansion):
-        return "(?:" + "|".join(_pattern(v) for v in value.values) + ")"
+        return "(?:" + "|".join(_pattern(v, anchored) for v in value.values) + ")"
     if isinstance(value, SigmaNumber):
-        return f"^{value.number}$"
+        return f"{a}{value.number}{z}"
     if isinstance(value, SigmaRegularExpression):
         flags = "".join(sorted({str(getattr(f, "name", f)).lower()[:1] for f in getattr(value, "flags", set()) or set()}
                                & {"i", "m", "s"}))
@@ -110,7 +112,7 @@ def _pattern(value) -> str:
             else:
                 out.append(re.escape(str(part)))
         cased = type(value).__name__ == "SigmaCasedString"
-        return ("(?:^" if cased else "(?i:^") + "".join(out) + "$)"   # scoped flag: safe inside alternations
+        return ("(?:" if cased else "(?i:") + a + "".join(out) + z + ")"   # scoped flag: safe inside alternations
     raise NotImplementedError(f"{type(value).__name__} values (e.g. cidr, null, numeric comparisons, field "
                               "references) have no Wazuh rule equivalent here")
 
@@ -123,7 +125,7 @@ def _dnf(node) -> list[list[_Lit]]:
     if isinstance(node, ConditionFieldEqualsValueExpression):
         return [[_Lit(node.field, [_pattern(node.value)])]]
     if isinstance(node, ConditionValueExpression):
-        return [[_Lit(None, [_pattern(node.value)])]]
+        return [[_Lit(None, [_pattern(node.value, anchored=False)])]]
     if isinstance(node, ConditionOR):
         leaves = node.args
         if all(isinstance(a, ConditionFieldEqualsValueExpression) for a in leaves) and len({a.field for a in leaves}) == 1:
@@ -187,6 +189,30 @@ def _parent(conj) -> str:
 
 def rule_slot(sigma_id: str) -> int:
     return RULE_ID_BASE + int(hashlib.sha256(sigma_id.encode()).hexdigest(), 16) % RULE_ID_SLOTS * SLOT_SIZE
+
+
+_RULE_ID = re.compile(r'(<rule id=")(\d+)(")')
+
+
+def resolve_slot_collisions(packages) -> None:
+    """Rules hash into RULE_ID_SLOTS slots, so two rules of one run can share ids (even odds at ~37 rules).
+    Each rule, in package order, gets its hashed slot or the next free one; per client, as each client deploys
+    its own copy. Deterministic for a given list of packages, and idempotent."""
+    used: dict[str, set[int]] = {}
+    for p in packages:
+        want = (rule_slot(p.rule_id) - RULE_ID_BASE) // SLOT_SIZE
+        for q in p.queries:
+            ids = [int(m[2]) for m in _RULE_ID.finditer(q.query or "")] if q.target == "wazuh_rule" and q.method != "llm" else []
+            taken = used.setdefault(q.client, set())
+            if not ids or len(taken) >= RULE_ID_SLOTS:
+                continue
+            slot = want
+            while slot in taken:
+                slot = (slot + 1) % RULE_ID_SLOTS
+            taken.add(slot)
+            delta = (slot - (min(ids) - RULE_ID_BASE) // SLOT_SIZE) * SLOT_SIZE
+            if delta:
+                q.query = _RULE_ID.sub(lambda m, d=delta: f"{m[1]}{int(m[2]) + d}{m[3]}", q.query)
 
 
 def _rule_elements(rule, level: int | None = None, group: str = "") -> list[ET.Element]:

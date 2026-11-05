@@ -39,8 +39,10 @@ _BOILER = re.compile(
     re.I,
 )
 _ATTACK = re.compile(r"\bT1\d{3}(?:\.\d{3})?\b")
+# A name starts only at the beginning of a [\w-] run (after at most two dashes, as \b allowed): starting at every
+# \b inside a long run rescans the run each time, quadratic on whole-report text.
 _CMD = re.compile(
-    r"(\b[\w-]+\.(?:exe|dll|ps1|psm1|bat|cmd|vbs|js|jse|hta|lnk|msi|scr|sh|py|elf|so)\b"
+    r"((?:(?<![\w-])|(?<=(?<![\w-])-)|(?<=(?<![\w-])--))(?=\w)[\w-]+\.(?:exe|dll|ps1|psm1|bat|cmd|vbs|js|jse|hta|lnk|msi|scr|sh|py|elf|so)\b"
     r"|\s/[a-z]{1,12}\b|\s-{1,2}[a-z][\w-]{1,20}\b|\\\\|HK(?:LM|CU|EY_)\b|%\w+%|\$env:"
     r"|\b(?:powershell|pwsh|cmd|rundll32|regsvr32|mshta|wscript|cscript|certutil|bitsadmin|schtasks|at|wmic"
     r"|net1?|nltest|whoami|systeminfo|ipconfig|tasklist|reg|sc|vssadmin|wevtutil|bcdedit|psexec|procdump"
@@ -56,7 +58,10 @@ _VERB = re.compile(
     r"|spawn\w*|abus\w*|leverag\w*|obfuscat\w*|encod\w*|deploy\w*|modif\w*|install\w*)\b",
     re.I,
 )
-_HEXLINE = re.compile(r"^(?:\s*(?:0x)?[0-9a-f]{2,}[\s:,]*){8,}$|^[A-Za-z0-9+/=]{80,}$", re.I)
+# Groups need a separator between them: with optional separators a long hex run followed by a non-hex
+# character backtracks exponentially, and `re` holds the GIL, which froze the whole web server.
+_HEXLINE = re.compile(r"^(?:0x)?[0-9a-f]{2,}(?:[\s:,]+(?:0x)?[0-9a-f]{2,}){7,}[\s:,]*$|^(?:0x)?[0-9a-f]{16,}$"
+                      r"|^[A-Za-z0-9+/=]{80,}$", re.I)
 _LONGTOKEN = re.compile(r"\S{121,}")
 
 
@@ -131,33 +136,82 @@ def split_blocks(text: str) -> tuple[list[Block], list[str]]:
     return blocks, dropped
 
 
+def _overhead(b: Block) -> int:
+    """Tokens of the '## heading' (or '[…]') line and separators a kept block may add to the output."""
+    return est_tokens(f"## {b.heading}\n\n\n\n") if b.heading else est_tokens("[…]\n\n\n\n")
+
+
+def _pieces(text: str, limit: int) -> list[str]:
+    """Split text into chunks of at most `limit` chars: on lines, then sentences, then hard cuts."""
+    units: list[str] = []
+    for line in text.splitlines():
+        if len(line) <= limit:
+            units.append(line)
+            continue
+        for sent in re.split(r"(?<=[.!?])\s+", line):
+            units += [sent[i:i + limit] for i in range(0, len(sent), limit)] if len(sent) > limit else [sent]
+    out, cur = [], ""
+    for u in units:
+        if cur and len(cur) + 1 + len(u) > limit:
+            out.append(cur)
+            cur = u
+        else:
+            cur = f"{cur}\n{u}" if cur else u
+    if cur.strip():
+        out.append(cur)
+    return [x for x in out if x.strip()]
+
+
+def _split_oversized(blocks: list[Block], budget_tokens: int) -> list[Block]:
+    """A block bigger than the whole budget (e.g. a report with single newlines only) could never be kept."""
+    out: list[Block] = []
+    for b in blocks:
+        if b.tokens + _overhead(b) <= budget_tokens:
+            out.append(b)
+            continue
+        # quarter-budget chunks, so the densest parts of the block can be picked
+        limit = max(40, int((budget_tokens // 4 - _overhead(b) - 1) * CHARS_PER_TOKEN))
+        out += [Block(0, b.heading, t, _score(t, b.heading), est_tokens(t)) for t in _pieces(b.text, limit)]
+    for i, b in enumerate(out):
+        b.idx = i
+    return out
+
+
 def condense(text: str, budget_tokens: int) -> Condensed:
     original = est_tokens(text)
     blocks, dropped = split_blocks(text)
 
-    # Near-duplicate removal (captions repeated around screenshots, etc.)
+    # Duplicate removal (captions repeated around screenshots, etc.): the whole normalized text, so distinct
+    # blocks that only share a long prefix are both kept.
     seen: set[str] = set()
     uniq = []
     for b in blocks:
-        key = re.sub(r"\W+", "", b.text.lower())[:160]
+        key = re.sub(r"\W+", "", b.text.lower())
         if key in seen:
             continue
         seen.add(key)
         uniq.append(b)
     blocks = uniq
 
-    total = sum(b.tokens for b in blocks)
+    total = sum(b.tokens + _overhead(b) for b in blocks)
     if total <= budget_tokens:
         chosen = [b for b in blocks if b.score > -5]
     else:
-        # Greedy by signal density; zero-signal prose is the first thing to go.
-        ranked = sorted((b for b in blocks if b.score > 0), key=lambda b: (b.score / b.tokens ** 0.5), reverse=True)
+        blocks = _split_oversized(blocks, budget_tokens)
+        # Greedy by signal density; zero-signal prose is the first thing to go (unless nothing else is left).
+        pool = [b for b in blocks if b.score > 0] or [b for b in blocks if b.score > -5] or blocks
+        ranked = sorted(pool, key=lambda b: (b.score / b.tokens ** 0.5), reverse=True)
         chosen, used = [], 0
         for b in ranked:
-            if used + b.tokens > budget_tokens:
+            cost = b.tokens + _overhead(b)
+            if used + cost > budget_tokens:
                 continue
             chosen.append(b)
-            used += b.tokens
+            used += cost
+        if not chosen and ranked:   # tiny budget: the best block, cut to fit, beats an empty report
+            b = ranked[0]
+            keep = max(1, int((budget_tokens - _overhead(b)) * CHARS_PER_TOKEN))
+            chosen = [Block(b.idx, b.heading, b.text[:keep], b.score, est_tokens(b.text[:keep]))]
         chosen.sort(key=lambda b: b.idx)
 
     out: list[str] = []

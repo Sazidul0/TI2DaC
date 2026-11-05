@@ -16,7 +16,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from . import __version__, attack, chains, clients, duplicates, obs, quality, redact, replay, safety
+from . import __version__, attack, chains, clients, duplicates, obs, quality, redact, replay, safety, wazuh
 from . import sigma_tools as st
 from .condense import condense, procedure_signals
 from .config import Settings
@@ -37,6 +37,7 @@ from .targets import FAMILIES, LLM_TARGET_LABELS, NATIVE_FIELDS, RENAMING_TARGET
 log = logging.getLogger(__name__)
 Progress = Callable[[str], None]
 _STRICT_TARGETS = ("sentinel_asim", "defender_xdr", "qradar_aql")
+_SEP = "\n\u241e\n"   # joins texts redacted in one pass (consistent placeholders); no pattern touches it
 
 
 def _noop(_: str) -> None:
@@ -105,9 +106,24 @@ def _new_run_id(loaded: LoadedReport, output_dir: str | Path | None = None) -> s
     slug = re.sub(r"[^a-z0-9]+", "-", loaded.meta.title.lower()).strip("-")[:48] or "report"
     base = f"{date.today().isoformat()}-{slug}-{loaded.meta.sha256[:8]}"
     run_id, n = base, 2
-    while output_dir is not None and (Path(output_dir) / run_id / "run.json").exists():
-        run_id, n = f"{base}-{n}", n + 1
+    while output_dir is not None:
+        # Reserve the directory now: run.json only appears at render, so two concurrent runs of one report
+        # would otherwise both pick the same id.
+        try:
+            (Path(output_dir) / run_id).mkdir(parents=True)
+            break
+        except FileExistsError:
+            run_id, n = f"{base}-{n}", n + 1
     return run_id
+
+
+def _release_run_id(output_dir: str | Path | None, run_id: str) -> None:
+    """Drop the reservation of a run that failed before anything was written (only an empty directory)."""
+    if output_dir is not None and run_id:
+        try:
+            (Path(output_dir) / run_id).rmdir()
+        except OSError:
+            pass
 
 
 def heuristic_analysis(loaded: LoadedReport, iocs: IOCSet) -> ReportAnalysis:
@@ -166,8 +182,12 @@ def analyze(loaded: LoadedReport, settings: Settings, llm: LLM | None, progress:
     obs.run_id.set(run_id)   # so the analysis call's ai.call event carries it
     if llm is not None:
         progress("stage 1: extracting behaviours")
-        analysis = llm.structured("analyze", ANALYZE_SYSTEM,
-                                  analyze_user(loaded.meta.title, cond.text, settings.ai.max_behaviours, loaded.meta.kind), ReportAnalysis)
+        try:
+            analysis = llm.structured("analyze", ANALYZE_SYSTEM,
+                                      analyze_user(loaded.meta.title, cond.text, settings.ai.max_behaviours, loaded.meta.kind), ReportAnalysis)
+        except BaseException:
+            _release_run_id(settings.output_dir, run_id)
+            raise
     else:
         analysis = heuristic_analysis(loaded, iocs)
         warnings.append("AI disabled: behaviours limited to explicitly cited ATT&CK IDs; write Sigma rules manually "
@@ -233,7 +253,11 @@ def _references(record: RunRecord) -> list[str]:
 
 def _assemble(record: RunRecord, b: Behaviour, draft: DetectionDraft, settings: Settings, slug: str,
               version: int = 1, rule_date: str | None = None) -> DetectionPackage:
-    rule_id = st.stable_rule_id(record.report.sha256, f"{b.technique_id}:{b.name}")
+    key = f"{b.technique_id}:{b.name}"
+    first = next((x for x in record.behaviours if f"{x.technique_id}:{x.name}" == key), b)
+    if first.id != b.id:   # a second behaviour with the same technique and name must not share the rule id
+        key += f":{b.id}"
+    rule_id = st.stable_rule_id(record.report.sha256, key)
     rule_yaml = st.render_rule(
         draft.sigma, rule_id=rule_id, author=settings.author, references=_references(record),
         tags=st.attack_tags(b.tactic, b.technique_id), rule_date=rule_date,
@@ -366,12 +390,13 @@ def check_ai_query(query: str, fields: dict[str, str], target: str) -> list[str]
     return problems
 
 
-def _translate_llm(pkg: DetectionPackage, settings: Settings, llm: LLM) -> None:
+def _translate_llm(pkg: DetectionPackage, settings: Settings, llm: LLM, redaction_map: dict | None = None) -> None:
     """AI translations: configured non-pySigma SIEMs, plus families no converter could produce, for the default
     schema and each client profile. The AI gets the field map and verified reference queries, and its answer is
     checked against the same map. Correlation rules are never sent: thresholds and joins are built by code."""
     correlated = len(st.load_docs(pkg.rule_yaml)) > 1
     default_results: dict[str, QueryResult] = {}
+    safe = rule_for_ai(pkg.rule_yaml)   # same AI-safe form as repair: no file name / URL references
     for client in [None, *clients.active(settings)]:
         cname = client.name if client is not None else ""
         by_target = {q.target: q for q in pkg.queries if q.client == cname}
@@ -402,12 +427,17 @@ def _translate_llm(pkg: DetectionPackage, settings: Settings, llm: LLM) -> None:
             fields = _ai_fields(pkg, client, members, tid)
             res = QueryResult(target=tid, label=label + " [AI-translated, unverified]", language=lang, method="llm",
                               client=cname)
+            # The rule (and so its converted reference queries) may be a human correction: redact both in one pass.
+            refs = _ai_references(pkg, cname)
+            sent = _SEP.join([safe, *refs.values()])
+            red = _redaction(sent, settings, redaction_map)
+            rule_text, *ref_texts = (red.text if red else sent).split(_SEP)
             try:
                 t = llm.structured("translate", TRANSLATE_SYSTEM,
-                                   translate_user(pkg.rule_yaml, label, lang, hint, why, fields,
-                                                  _ai_references(pkg, cname), client.notes_for(tid) if client else ""),
+                                   translate_user(rule_text, label, lang, hint, why, fields, dict(zip(refs, ref_texts)),
+                                                  client.notes_for(tid) if client else ""),
                                    TranslationDraft)
-                res.query, res.notes = t.query.strip(), f"confidence={t.confidence}; {t.notes}"
+                res.query, res.notes = _unredact(t.query.strip(), red, sent), f"confidence={t.confidence}; {t.notes}"
                 problems = check_ai_query(res.query, fields, tid)
                 if problems:
                     res.notes += " CHECK: " + "; ".join(problems)
@@ -456,17 +486,25 @@ def _flag_unmapped_fields(pkg: DetectionPackage, settings: Settings) -> None:
 
 
 def finalize_package(pkg: DetectionPackage, record: RunRecord, settings: Settings, llm: LLM | None,
-                     feedback_text: str = "", progress: Progress = _noop, allow_repair: bool = True) -> DetectionPackage:
-    """Validate/convert, repair with the model if needed, then map fields, lint, translate."""
+                     feedback_text: str = "", progress: Progress = _noop, allow_repair: bool = True,
+                     redaction_map: dict | None = None) -> DetectionPackage:
+    """Validate/convert, repair with the model if needed, then map fields, lint, translate.
+    `redaction_map`: the run's placeholders, reused for text sent to the AI (default: read from the run folder)."""
+    if llm is not None and redaction_map is None and record is not None:
+        redaction_map = run_redaction_map(record, settings)
     blocking = _check(pkg, settings, record)
     while ((blocking or feedback_text) and allow_repair and llm is not None
            and pkg.repair_attempts < settings.ai.max_repair_attempts):
         pkg.repair_attempts += 1
         progress(f"{pkg.slug}: repair attempt {pkg.repair_attempts} ({len(blocking)} issue(s))")
-        fixed = llm.structured("repair", REPAIR_SYSTEM,
-                               repair_user(rule_for_ai(pkg.rule_yaml), blocking or ["Apply reviewer feedback."],
-                                           redact_for_ai(feedback_text, settings)),
+        # The rule may be a human correction: rule and feedback are redacted in one pass (same placeholders).
+        sent = _SEP.join([rule_for_ai(pkg.rule_yaml), feedback_text])
+        red = _redaction(sent, settings, redaction_map)
+        rule_text, fb_text = (red.text if red else sent).split(_SEP)
+        fixed = llm.structured("repair", REPAIR_SYSTEM, repair_user(rule_text, blocking or ["Apply reviewer feedback."], fb_text),
                                SigmaDraft)
+        if red is not None:   # values people wrote come back; placeholders from the report stay
+            fixed = SigmaDraft.model_validate_json(_unredact(fixed.model_dump_json(), red, sent, quote=True))
         feedback_text = ""
         pkg.draft.sigma = fixed
         rid, ver = pkg.rule_id, pkg.version
@@ -481,7 +519,7 @@ def finalize_package(pkg: DetectionPackage, record: RunRecord, settings: Setting
         _flag_unmapped_fields(pkg, settings)
         pkg.similar_rules = duplicates.find_similar(pkg.rule_yaml, settings)
         if llm is not None:
-            _translate_llm(pkg, settings, llm)
+            _translate_llm(pkg, settings, llm, redaction_map)
     _lint_simulation(pkg)
     return pkg
 
@@ -500,8 +538,11 @@ def likely_categories(b) -> list[str]:
 
 
 def generate(record: RunRecord, settings: Settings, llm: LLM, store: Store | None = None,
-             progress: Progress = _noop, behaviour_ids: list[str] | None = None, actor: str = "") -> list[DetectionPackage]:
+             progress: Progress = _noop, behaviour_ids: list[str] | None = None, actor: str = "",
+             redaction_map: dict | None = None) -> list[DetectionPackage]:
     obs.run_id.set(record.run_id)
+    if redaction_map is None:
+        redaction_map = run_redaction_map(record, settings)
     todo = [b for b in record.behaviours if (b.id in behaviour_ids if behaviour_ids else b.selected)]
     existing = {p.behaviour.id for p in record.packages}
     todo = [b for b in todo if b.id not in existing]
@@ -519,8 +560,10 @@ def generate(record: RunRecord, settings: Settings, llm: LLM, store: Store | Non
         lessons = []
         if store is not None:
             prod = "windows" if b.platform == "windows" else b.platform
-            lessons = [redact_for_ai(x, settings) for x in
-                       store.relevant_lessons(b.technique_id, prod, likely_categories(b), settings.ai.max_lessons_in_prompt)]
+            lessons = [redact_for_ai(x, settings, redaction_map) for x in
+                       store.relevant_lessons(b.technique_id, prod, likely_categories(b), settings.ai.max_lessons_in_prompt,
+                                              redact.lesson_tlps(record.report.tlp_effective,
+                                                                 settings.ai.allowed_tlp.get(settings.ai.provider, [])))]
         payload = b.model_dump(include={"name", "description", "tactic", "technique_id", "technique_name",
                                         "platform", "observables", "log_sources", "detection_idea"})
         payload["observables"] = {k: v for k, v in payload["observables"].items() if v}
@@ -529,9 +572,12 @@ def generate(record: RunRecord, settings: Settings, llm: LLM, store: Store | Non
             draft = llm.structured("generate", GENERATE_SYSTEM, generate_user(payload, evidence, context, lessons), DetectionDraft)
             pkg = _assemble(record, b, draft, settings, slug)
             pkg.created_by = actor or record.created_by
-            return finalize_package(pkg, record, settings, llm, progress=progress)
-        except LLMError as e:
+            return finalize_package(pkg, record, settings, llm, progress=progress, redaction_map=redaction_map)
+        except Exception as e:
             # One failed behaviour must not discard the others; it can be retried with `ti2dac generate`.
+            if not isinstance(e, LLMError):
+                log.exception("%s: unexpected error generating %s", slug, b.id)
+                e = f"{type(e).__name__}: {e}"
             record.warnings.append(f"{b.id} ({b.technique_id}) not generated: {e}. Retry: ti2dac generate {record.run_id} --select {b.id}")
             progress(f"{slug}: FAILED ({e})")
             obs.event("rule.failed", logging.WARNING, behaviour=b.id, technique=b.technique_id, error=str(e)[:500])
@@ -544,6 +590,7 @@ def generate(record: RunRecord, settings: Settings, llm: LLM, store: Store | Non
         if p.slug != f"rule-{i:03d}":
             p.slug = f"rule-{i:03d}"
     record.packages.extend(pkgs)
+    wazuh.resolve_slot_collisions(record.packages)
     rebuild_chains(record, settings, progress)
     record.usage = llm.usage
     record.usage.estimated_cost_usd = estimate_cost(record.usage, settings.ai.prices)
@@ -613,6 +660,7 @@ def run(source: str, settings: Settings, **kw) -> tuple[RunRecord, LoadedReport]
     try:
         record, loaded = _run(source, settings, **kw)
     except Exception as e:
+        _release_run_id(settings.output_dir, obs.run_id.get())
         obs.event("run.failed", logging.WARNING, error_type=type(e).__name__, error=str(e)[:500],
                   duration_s=round(time.monotonic() - t0, 1))
         raise
@@ -647,7 +695,7 @@ def _run(source: str, settings: Settings, *, count: int | None = None, explicit:
             store.audit(actor, "tlp.override", {"run_id": record.run_id, "tlp": loaded.meta.tlp_effective,
                                                 "provider": settings.ai.provider, "reason": tlp_override})
     if llm is not None:
-        generate(record, settings, llm, store, progress, actor=actor)
+        generate(record, settings, llm, store, progress, actor=actor, redaction_map=loaded.redaction_map)
     events = loaded.embedded_events + list(evidence_events or [])
     if events and record.packages:
         replay_evidence(record, events, store, actor, progress)
@@ -663,7 +711,8 @@ _INCIDENT_HINTS = re.compile(
     r"incident report|incident summary|root cause|containment|eradication|lessons learned|post[- ]incident|"
     r"affected (host|system|user)s?|host was isolated|\bisolated\b|\bIR-\d|incident (id|number|ticket)|severity:|"
     r"timeline \(utc\)|first observed|patient zero|initial access vector", re.I)
-_EVENT_LINE = re.compile(r"^\s*(\{.*\})\s*,?\s*$", re.M)
+# [^\S\n], not \s: a \s* that spans blank lines rescans them from every line start (quadratic on whole reports).
+_EVENT_LINE = re.compile(r"^[^\S\n]*(\{.*\})[^\S\n]*,?[^\S\n]*$", re.M)
 
 
 def looks_like_incident(text: str) -> bool:
@@ -676,12 +725,12 @@ def extract_embedded_events(text: str) -> list[dict]:
     for m in _EVENT_LINE.finditer(text):
         try:
             obj = json.loads(m.group(1))
-        except ValueError:
+            ev = replay.normalize_event(obj) if isinstance(obj, dict) and len(obj) >= 2 else None
+        except (ValueError, RecursionError):   # deeply nested JSON: not a log event
             continue
-        if isinstance(obj, dict) and len(obj) >= 2:
-            ev = replay.normalize_event(obj)
-            if any(k in ev for k in ("EventID", "Image", "CommandLine", "TargetObject", "ScriptBlockText", "QueryName")):
-                events.append(ev)
+        if ev is not None and any(k in ev for k in ("EventID", "Image", "CommandLine", "TargetObject", "ScriptBlockText",
+                                                    "QueryName")):
+            events.append(ev)
     return events
 
 
@@ -704,7 +753,7 @@ def prepare_report(loaded: LoadedReport, settings: Settings, *, incident: bool |
         meta.tlp_override = tlp_override
     if settings.redaction.enabled:
         rc = settings.redaction
-        sep = "\n\u241e\n"   # keeps title and body in one pass so placeholders are consistent
+        sep = _SEP   # keeps title and body in one pass so placeholders are consistent
         red = redact.redact(meta.title + sep + loaded.text, internal_domains=rc.internal_domains,
                             internal_networks=rc.internal_networks, terms=rc.terms, hostname_patterns=rc.hostname_patterns)
         meta.title, loaded.text = red.text.split(sep, 1)
@@ -742,8 +791,9 @@ def replay_evidence(record: RunRecord, events: list[dict], store: Store | None, 
 # --------------------------------------------------------------------------- feedback application
 def apply_correction(record: RunRecord, slug: str, settings: Settings, *, corrected_yaml: str | None = None,
                      feedback_text: str = "", llm: LLM | None = None, progress: Progress = _noop,
-                     actor: str = "") -> DetectionPackage:
-    """Create rule version n+1 from a human-corrected YAML or (with AI) from feedback text."""
+                     actor: str = "", redaction_map: dict | None = None) -> DetectionPackage:
+    """Create rule version n+1 from a human-corrected YAML or (with AI) from feedback text.
+    Text sent to the AI is redacted with the run's placeholders (`redaction_map`, default: the run folder's)."""
     import yaml
 
     idx = next(i for i, p in enumerate(record.packages) if p.slug == slug)
@@ -779,16 +829,18 @@ def apply_correction(record: RunRecord, slug: str, settings: Settings, *, correc
         new.draft.sigma.level = data.get("level", new.draft.sigma.level)
         new.draft.sigma.falsepositives = list(data.get("falsepositives") or [])
         # Never let the model rewrite a human correction; it may only fill SIEM query gaps.
-        finalize_package(new, record, settings, llm, progress=progress, allow_repair=False)
+        finalize_package(new, record, settings, llm, progress=progress, allow_repair=False, redaction_map=redaction_map)
     else:
         if llm is None:
             raise ValueError("no corrected rule supplied and AI is disabled")
         # Start from the CURRENT rule (which may be a human correction), never from the original AI draft.
         new.rule_yaml = st.set_status(old.rule_yaml, "experimental", modified=date.today().isoformat())
-        finalize_package(new, record, settings, llm, feedback_text=feedback_text, progress=progress)
+        finalize_package(new, record, settings, llm, feedback_text=feedback_text, progress=progress,
+                         redaction_map=redaction_map)
     if new.sigma_status == "failed":
         raise ValueError("corrected rule does not validate: " + "; ".join(new.sigma_issues[:5]))
     record.packages[idx] = new
+    wazuh.resolve_slot_collisions(record.packages)
     rebuild_chains(record, settings, progress)
     return new
 
@@ -824,13 +876,47 @@ def check_tlp_for_run(record: RunRecord, settings: Settings) -> None:
         raise PolicyError(f"run {record.run_id} is TLP:{tlp.upper()}, which provider '{settings.ai.provider}' may not receive")
 
 
-def redact_for_ai(text: str, settings: Settings) -> str:
-    """Free text written by people (feedback comments, lessons) is redacted like reports before any prompt."""
+def _redaction(text: str, settings: Settings, known: dict | None = None) -> redact.Redaction | None:
     if not text or not settings.redaction.enabled:
-        return text
+        return None
     rc = settings.redaction
     return redact.redact(text, internal_domains=rc.internal_domains, internal_networks=rc.internal_networks,
-                         terms=rc.terms, hostname_patterns=rc.hostname_patterns).text
+                         terms=rc.terms, hostname_patterns=rc.hostname_patterns, known=known)
+
+
+def redact_for_ai(text: str, settings: Settings, known: dict | None = None) -> str:
+    """Text written by people (feedback comments, lessons, corrected rules) is redacted like reports before any
+    prompt. `known`: the run's redaction map, so hosts/users learned from the report stay hidden here too."""
+    red = _redaction(text, settings, known)
+    return red.text if red else text
+
+
+def _unredact(answer: str, red: redact.Redaction | None, sent: str, quote: bool = False) -> str:
+    """Put back the values this redaction hid (placeholders already in `sent` before redaction stay).
+    `quote`: the answer is JSON text."""
+    if red is None:
+        return answer
+    hidden = {ph: red.mapping[ph] for ph in set(redact.PLACEHOLDER.findall(red.text)) - set(redact.PLACEHOLDER.findall(sent))
+              if ph in red.mapping}
+    return redact.PLACEHOLDER.sub(lambda m: (json.dumps(hidden[m[0]])[1:-1] if quote else hidden[m[0]])
+                                  if m[0] in hidden else m[0], answer)
+
+
+def run_redaction_map(record: RunRecord, settings: Settings) -> dict[str, str]:
+    """The run's placeholder map (source/redaction-map.json, written by render; never sent anywhere)."""
+    dirs = [Path(settings.output_dir) / record.run_id]
+    if Path(settings.db_path).is_file():
+        p = Store(settings.db_path).run_path(record.run_id)
+        if p:
+            dirs.insert(0, Path(p))
+    for d in dirs:
+        try:
+            data = json.loads((d / "source" / "redaction-map.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+    return {}
 
 
 def rule_for_ai(rule_yaml: str) -> str:

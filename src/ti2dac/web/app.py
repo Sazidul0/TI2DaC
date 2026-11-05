@@ -16,10 +16,8 @@ import logging
 import os
 import re
 import secrets
-import shutil
-import threading
+import tempfile
 import time
-import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -32,16 +30,19 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.templating import Jinja2Templates
 from markdown_it import MarkdownIt
 from markupsafe import Markup
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .. import __version__, aistatus, attack, health, modelchoice, obs
 from ..config import STAGES, Settings, env_file, env_source, set_env_secret
 from ..feedback import ARTIFACTS, CATEGORIES, REVIEW_STATES, SEVERITIES, TEST_RESULTS, Store, target_status
-from ..llm import LLM, LLMError, verify_key
-from ..render import load_record, render, rule_filename
+from ..llm import LLM, verify_key
+from ..render import load_record, rule_filename
 from ..targets import LLM_TARGET_LABELS, TARGETS
 from ..users import Users
+from . import jobs as jobs_mod
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 _MD = MarkdownIt("commonmark", {"html": False}).enable("table")   # raw HTML in generated docs is escaped
@@ -107,11 +108,11 @@ class _Security(BaseHTTPMiddleware):
         if request.url.path == "/healthz":   # for uptime checkers: no login, no details that need one
             return await call_next(request)
         if self.users.any() or (self.user and self.password):
-            who = self._authenticate(request)
+            who = await run_in_threadpool(self._authenticate, request)   # PBKDF2 takes ~0.1s: keep it off the event loop
             if who is None:
                 if request.headers.get("authorization"):   # a wrong login, not a browser's first unauthenticated request
-                    self.store.audit(self._claimed_user(request), "auth.failed",
-                                     {"client": client, "path": request.url.path}, logging.WARNING)
+                    await run_in_threadpool(self.store.audit, self._claimed_user(request), "auth.failed",
+                                            {"client": client, "path": request.url.path}, logging.WARNING)
                 return PlainTextResponse("authentication required", 401, {"WWW-Authenticate": 'Basic realm="ti2dac"'})
             request.state.user, request.state.role = who
         else:   # local single-user mode (loopback only, enforced by `ti2dac serve`)
@@ -119,8 +120,9 @@ class _Security(BaseHTTPMiddleware):
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             origin = request.headers.get("origin") or request.headers.get("referer")
             if origin and urlparse(origin).netloc != request.headers.get("host"):
-                self.store.audit(request.state.user, "csrf.refused", {"client": client, "path": request.url.path,
-                                                                      "origin": urlparse(origin).netloc[:200]}, logging.WARNING)
+                await run_in_threadpool(self.store.audit, request.state.user, "csrf.refused",
+                                        {"client": client, "path": request.url.path,
+                                         "origin": urlparse(origin).netloc[:200]}, logging.WARNING)
                 return PlainTextResponse("cross-origin request refused", 403)
         resp = await call_next(request)
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -147,6 +149,8 @@ def create_app(settings: Settings) -> FastAPI:
                          "role": getattr(request.state, "role", "")}, logging.WARNING)
         return await http_exception_handler(request, exc)
     store.interrupt_running_jobs()   # jobs from a previous process cannot still be running
+    jobs = jobs_mod.Jobs(store)
+    app.state.jobs = jobs
     key_checks: dict[str, dict] = {}   # provider -> last key check shown on the AI page (never the key)
     model_msgs: dict[str, dict] = {}   # provider -> last model save / list refresh result
     choice_seen = [modelchoice.saved_mtime(settings)]
@@ -168,8 +172,10 @@ def create_app(settings: Settings) -> FastAPI:
         return path
 
     def rerender(record, path: Path) -> None:
-        render(record, path, test_results=store.test_results(record.run_id))
-        store.register_run(record, str(path))
+        jobs_mod.rerender(settings, store, record, path)
+
+    def run_lock(run_id: str):
+        return jobs_mod.run_lock(settings, run_id)
 
     def ai_info() -> dict:
         prov = settings.ai.provider
@@ -197,34 +203,8 @@ def create_app(settings: Settings) -> FastAPI:
         return {"request": request, "user": request.state.user, "role": request.state.role, "version": __version__,
                 "ai_enabled": settings.ai.enabled, "ai": ai_info(), **kw}
 
-    def start_job(fn, label: str, actor: str) -> str:
-        """Background job; state is persisted so it survives page reloads and shows up after restarts."""
-        jid = uuid.uuid4().hex[:12]
-        store.job_create(jid, label, actor)
-
-        def progress(msg: str) -> None:
-            store.job_log(jid, msg)
-
-        def target():
-            obs.job_id.set(jid)
-            t0, status, run_id, error = time.monotonic(), "done", None, None
-            obs.event("job.start", label=label[:200], actor=actor)
-            try:
-                run_id = fn(progress)
-                store.job_finish(jid, "done", run_id=run_id)
-            except (LLMError, ValueError) as e:
-                status, error = "failed", str(e)
-                store.job_finish(jid, "failed", error=error)
-            except Exception as e:  # surface unexpected failures to the operator
-                status, error = "failed", f"{type(e).__name__}: {e}"
-                store.job_log(jid, traceback.format_exc(limit=3))
-                store.job_finish(jid, "failed", error=error)
-                obs.log.exception("job %s crashed", jid)
-            obs.event("job.finish", logging.WARNING if status == "failed" else logging.INFO, status=status,
-                      run_id=run_id or "", error=(error or "")[:500], duration_s=round(time.monotonic() - t0, 1))
-
-        threading.Thread(target=target, daemon=True).start()
-        return jid
+    def start_job(fn, kw: dict, label: str, actor: str) -> str:
+        return jobs.start(fn, kw, settings, label, actor)
 
     # ------------------------------------------------------------------ pages
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -251,8 +231,6 @@ def create_app(settings: Settings) -> FastAPI:
     async def create_run(request: Request, url: str = Form(""), count: int = Form(3), select: str = Form(""),
                          doc_type: str = Form("auto"), file: UploadFile | None = File(None)):
         """Start an analysis from an uploaded report (`file`) or a public `url`. Redirects to the job (`/jobs/{id}`)."""
-        from ..pipeline import run as run_pipeline
-
         raw, filename = None, None
         if file is not None and file.filename:
             raw = await file.read(settings.fetch.max_bytes + 1)
@@ -261,24 +239,16 @@ def create_app(settings: Settings) -> FastAPI:
             filename = file.filename
         elif not url.strip():
             raise HTTPException(400, "upload a report or give a URL")
+        elif not re.match(r"^https?://", url.strip(), re.IGNORECASE):   # anything else is a path on this server (LFI)
+            raise HTTPException(400, "the URL must start with http:// or https://")
         source = filename or url.strip()
         explicit = [x for x in select.replace(" ", "").split(",") if x] or None
         if ai_blocked():
             return RedirectResponse("/ai?blocked=1", 303)
 
-        def work(progress):
-            record, loaded = run_pipeline(source, settings, count=max(1, min(count, 10)), explicit=explicit,
-                                          raw=raw, filename=filename, store=store, progress=progress,
-                                          actor=request.state.user,
-                                          incident={"incident": True, "threat-intel": False}.get(doc_type))
-            path = Path(settings.output_dir) / record.run_id
-            render(record, path, raw=loaded.raw, filename=loaded.filename, test_results=store.test_results(record.run_id),
-                   redaction_map=loaded.redaction_map, embedded_events=loaded.embedded_events)
-            store.register_run(record, str(path))
-            store.audit(request.state.user, "run.create", {"run_id": record.run_id, "source": source})
-            return record.run_id
-
-        return RedirectResponse(f"/jobs/{start_job(work, source, request.state.user)}", 303)
+        kw = {"source": source, "raw": raw, "filename": filename, "count": max(1, min(count, 10)), "explicit": explicit,
+              "incident": {"incident": True, "threat-intel": False}.get(doc_type), "actor": request.state.user}
+        return RedirectResponse(f"/jobs/{start_job(jobs_mod.new_run, kw, source, request.state.user)}", 303)
 
     @app.get("/jobs/{jid}", response_class=HTMLResponse, include_in_schema=False)
     def job_page(request: Request, jid: str):
@@ -287,7 +257,20 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(404, "unknown job")
         if job["status"] == "done" and job["run_id"]:
             return RedirectResponse(f"/runs/{job['run_id']}", 303)
-        return TEMPLATES.TemplateResponse(request, "job.html", ctx(request, job=job))
+        return TEMPLATES.TemplateResponse(request, "job.html", ctx(request, job=job, can_stop=jobs.can_stop(jid)))
+
+    @app.post("/jobs/{jid}/stop")
+    def stop_job(request: Request, jid: str):
+        """Stop a running job (the user who started it, approvers and admins). Nothing it did not finish is kept."""
+        job = store.get_job(jid)
+        if job is None:
+            raise HTTPException(404, "unknown job")
+        if request.state.user != job["actor"] and request.state.role not in ("approver", "admin"):
+            raise HTTPException(403, "only the user who started the job, an approver or an admin can stop it")
+        if not jobs.stop(jid, request.state.user):
+            raise HTTPException(409, "this job is not running in a worker that can be stopped")
+        store.audit(request.state.user, "job.stop", {"job_id": jid, "label": job["label"][:200]}, logging.WARNING)
+        return RedirectResponse(f"/jobs/{jid}", 303)
 
     @app.get("/runs/{run_id}", response_class=HTMLResponse, include_in_schema=False)
     def run_page(request: Request, run_id: str, fb: int = 0):
@@ -313,8 +296,6 @@ def create_app(settings: Settings) -> FastAPI:
     @app.post("/runs/{run_id}/generate")
     def generate_more(request: Request, run_id: str, select: str = Form(...)):
         """Generate rules for more behaviours of a run, e.g. `select=B4,B7`. Runs as a background job."""
-        from ..pipeline import generate
-
         if not settings.ai.enabled:
             raise HTTPException(400, "AI is disabled")
         if ai_blocked():
@@ -322,17 +303,8 @@ def create_app(settings: Settings) -> FastAPI:
         path = run_dir(run_id)
         ids = [x.strip().upper() for x in select.split(",") if x.strip()]
 
-        def work(progress):
-            from ..pipeline import check_tlp_for_run
-
-            record = load_record(path)
-            check_tlp_for_run(record, settings)
-            generate(record, settings, LLM(settings, record.usage, tlp=record.report.tlp_effective), store, progress, behaviour_ids=ids,
-                     actor=request.state.user)
-            rerender(record, path)
-            return run_id
-
-        return RedirectResponse(f"/jobs/{start_job(work, f'{run_id}: generate {ids}', request.state.user)}", 303)
+        kw = {"run_id": run_id, "path": str(path), "behaviour_ids": ids, "actor": request.state.user}
+        return RedirectResponse(f"/jobs/{start_job(jobs_mod.generate_more, kw, f'{run_id}: generate {ids}', request.state.user)}", 303)
 
     @app.post("/runs/{run_id}/rules/{slug}/feedback")
     def add_feedback(request: Request, run_id: str, slug: str, artifact: str = Form(...), category: str = Form(...),
@@ -342,34 +314,37 @@ def create_app(settings: Settings) -> FastAPI:
         from ..pipeline import apply_correction
 
         path = run_dir(run_id)
-        record = load_record(path)
-        pkg = next((p for p in record.packages if p.slug == slug), None)
-        if pkg is None:
-            raise HTTPException(404, "unknown rule")
-        try:
-            fid = store.add_feedback(reviewer=request.state.user, run_id=run_id, slug=slug, rule_id=pkg.rule_id,
-                                     rule_version=pkg.version, artifact=artifact, category=category, severity=severity,
-                                     comment=comment, correction=correction, target=target)
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        if correction.strip() and artifact == "sigma_rule":
+        applies = bool(correction.strip()) and artifact == "sigma_rule"
+        if applies and ai_blocked():   # applying a correction translates SIEM query gaps with AI
+            return RedirectResponse("/ai?blocked=1", 303)
+        with run_lock(run_id):
+            record = load_record(path)
+            pkg = next((p for p in record.packages if p.slug == slug), None)
+            if pkg is None:
+                raise HTTPException(404, "unknown rule")
             try:
-                new = apply_correction(record, slug, settings, corrected_yaml=correction,
-                                       llm=LLM(settings, record.usage, tlp=record.report.tlp_effective) if settings.ai.enabled else None,
-                                       actor=request.state.user)
-                store.resolve_feedback(fid, "applied", f"{slug} -> v{new.version}", request.state.user)
-                store.add_lesson(store.get_feedback(fid), new.behaviour.technique_id, new.draft.sigma.logsource.product,
-                                 new.draft.sigma.logsource.category or new.draft.sigma.logsource.service)
-                rerender(record, path)
+                fid = store.add_feedback(reviewer=request.state.user, run_id=run_id, slug=slug, rule_id=pkg.rule_id,
+                                         rule_version=pkg.version, artifact=artifact, category=category, severity=severity,
+                                         comment=comment, correction=correction, target=target)
             except ValueError as e:
-                store.resolve_feedback(fid, "open", f"correction rejected: {e}", request.state.user)
+                raise HTTPException(400, str(e))
+            if applies:
+                try:
+                    new = apply_correction(record, slug, settings, corrected_yaml=correction,
+                                           llm=LLM(settings, record.usage, tlp=record.report.tlp_effective) if settings.ai.enabled else None,
+                                           actor=request.state.user)
+                    store.resolve_feedback(fid, "applied", f"{slug} -> v{new.version}", request.state.user)
+                    store.add_lesson(store.get_feedback(fid), new.behaviour.technique_id, new.draft.sigma.logsource.product,
+                                     new.draft.sigma.logsource.category or new.draft.sigma.logsource.service,
+                                     tlp=record.report.tlp_effective)
+                    rerender(record, path)
+                except ValueError as e:
+                    store.resolve_feedback(fid, "open", f"correction rejected: {e}", request.state.user)
         return RedirectResponse(f"/runs/{run_id}?fb={fid}#{slug}", 303)
 
     @app.post("/feedback/{fid}/apply")
     def apply_feedback(request: Request, fid: int):
         """Let the AI rewrite the rule from open feedback; the result is a new draft version."""
-        from ..pipeline import apply_correction
-
         fb = store.get_feedback(fid)
         if not fb:
             raise HTTPException(404)
@@ -381,19 +356,8 @@ def create_app(settings: Settings) -> FastAPI:
             return RedirectResponse("/ai?blocked=1", 303)
         path = run_dir(fb["run_id"])
         user = request.state.user
-
-        def work(progress):
-            record = load_record(path)
-            text = f"[{fb['category']}] {fb['comment']}" + (f" (SIEM: {fb['target']})" if fb["target"] else "")
-            new = apply_correction(record, fb["slug"], settings, feedback_text=text, llm=LLM(settings, record.usage, tlp=record.report.tlp_effective),
-                                   progress=progress, actor=user)
-            store.resolve_feedback(fid, "applied", f"{fb['slug']} -> v{new.version} (AI)", user)
-            store.add_lesson(fb, new.behaviour.technique_id, new.draft.sigma.logsource.product,
-                             new.draft.sigma.logsource.category or new.draft.sigma.logsource.service)
-            rerender(record, path)
-            return fb["run_id"]
-
-        return RedirectResponse(f"/jobs/{start_job(work, f'apply feedback #{fid}', user)}", 303)
+        kw = {"fid": fid, "path": str(path), "actor": user}
+        return RedirectResponse(f"/jobs/{start_job(jobs_mod.apply_feedback, kw, f'apply feedback #{fid}', user)}", 303)
 
     @app.post("/feedback/{fid}/resolve")
     def resolve_feedback(request: Request, fid: int, status: str = Form(...), note: str = Form(""),
@@ -407,10 +371,12 @@ def create_app(settings: Settings) -> FastAPI:
         except ValueError as e:
             raise HTTPException(400, str(e))
         if lesson and status == "applied":   # fixed outside the tool, but the advice is still reusable
-            pkg = next((p for p in load_record(run_dir(fb["run_id"])).packages if p.slug == fb["slug"]), None)
+            record = load_record(run_dir(fb["run_id"]))
+            pkg = next((p for p in record.packages if p.slug == fb["slug"]), None)
             if pkg is not None:
                 ls = pkg.draft.sigma.logsource
-                store.add_lesson(fb, pkg.behaviour.technique_id, ls.product, ls.category or ls.service)
+                store.add_lesson(fb, pkg.behaviour.technique_id, ls.product, ls.category or ls.service,
+                                 tlp=record.report.tlp_effective)
         return RedirectResponse(f"/runs/{fb['run_id']}#{fb['slug']}", 303)
 
     @app.post("/runs/{run_id}/rules/{slug}/test")
@@ -418,16 +384,17 @@ def create_app(settings: Settings) -> FastAPI:
                  fp_count: int = Form(0), evidence: str = Form(""), environment: str = Form("")):
         """Record a lab test or alert disposition for one SIEM target (or `all`)."""
         path = run_dir(run_id)
-        record = load_record(path)
-        pkg = next((p for p in record.packages if p.slug == slug), None)
-        if pkg is None or target not in {q.target for q in pkg.queries} | {"all"}:
-            raise HTTPException(400, "unknown rule or target")
-        try:
-            store.add_test_result(tester=request.state.user, run_id=run_id, slug=slug, rule_version=pkg.version,
-                                  target=target, result=result, fp_count=fp_count, evidence=evidence, environment=environment)
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        rerender(record, path)
+        with run_lock(run_id):
+            record = load_record(path)
+            pkg = next((p for p in record.packages if p.slug == slug), None)
+            if pkg is None or target not in {q.target for q in pkg.queries} | {"all"}:
+                raise HTTPException(400, "unknown rule or target")
+            try:
+                store.add_test_result(tester=request.state.user, run_id=run_id, slug=slug, rule_version=pkg.version,
+                                      target=target, result=result, fp_count=fp_count, evidence=evidence, environment=environment)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            rerender(record, path)
         return RedirectResponse(f"/runs/{run_id}#{slug}", 303)
 
     @app.post("/runs/{run_id}/rules/{slug}/review")
@@ -439,19 +406,20 @@ def create_app(settings: Settings) -> FastAPI:
         if status not in REVIEW_STATES:
             raise HTTPException(400, "bad status")
         path = run_dir(run_id)
-        record = load_record(path)
-        pkg = next((p for p in record.packages if p.slug == slug), None)
-        if pkg is None:
-            raise HTTPException(404)
-        if status == "approved" and request.state.role not in ("approver", "admin"):
-            raise HTTPException(403, "only users with the approver role can approve rules")
-        problem = review_problem(pkg, status, request.state.user)
-        if problem:
-            raise HTTPException(409, problem)
-        pkg.review_status = status  # type: ignore[assignment]
-        pkg.rule_yaml = set_status(pkg.rule_yaml, "test" if status == "approved" else "experimental")
-        store.set_review(run_id, slug, status, request.state.user, note)
-        rerender(record, path)
+        with run_lock(run_id):
+            record = load_record(path)
+            pkg = next((p for p in record.packages if p.slug == slug), None)
+            if pkg is None:
+                raise HTTPException(404)
+            if "approved" in (status, pkg.review_status) and request.state.role not in ("approver", "admin"):
+                raise HTTPException(403, "only users with the approver role can approve rules or change an approved rule")
+            problem = review_problem(pkg, status, request.state.user)
+            if problem:
+                raise HTTPException(409, problem)
+            pkg.review_status = status  # type: ignore[assignment]
+            pkg.rule_yaml = set_status(pkg.rule_yaml, "test" if status == "approved" else "experimental")
+            store.set_review(run_id, slug, status, request.state.user, note)
+            rerender(record, path)
         return RedirectResponse(f"/runs/{run_id}#{slug}", 303)
 
     @app.get("/runs/{run_id}/download")
@@ -464,20 +432,26 @@ def create_app(settings: Settings) -> FastAPI:
         # whatever the document type: TLP-marked threat intel can be just as restricted as an incident report.
         import zipfile
 
-        archive = tmp / f"{run_id}.zip"
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in sorted(path.rglob("*")):
-                rel = f.relative_to(path)
-                if f.is_file() and rel.parts[0] not in ("source", "evidence"):
-                    zf.write(f, rel.as_posix())
-        return FileResponse(archive, filename=f"{run_id}.zip", media_type="application/zip")
+        fd, name = tempfile.mkstemp(suffix=".zip", dir=tmp)   # one file per request: downloads may overlap
+        archive = Path(name)
+        try:
+            with os.fdopen(fd, "wb") as fh, zipfile.ZipFile(fh, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in sorted(path.rglob("*")):
+                    rel = f.relative_to(path)
+                    if f.is_file() and rel.parts[0] not in ("source", "evidence"):
+                        zf.write(f, rel.as_posix())
+        except BaseException:
+            archive.unlink(missing_ok=True)
+            raise
+        return FileResponse(archive, filename=f"{run_id}.zip", media_type="application/zip",
+                            background=BackgroundTask(archive.unlink, missing_ok=True))
 
     @app.get("/runs/{run_id}/files/{rel:path}")
     def raw_file(run_id: str, rel: str):
-        """One generated file of a run as plain text, e.g. `rules/rule-001-....yml`."""
+        """One generated file of a run as plain text, e.g. `rules/rule-001-....yml`. Never source/ or evidence/."""
         base = run_dir(run_id).resolve()
         target = (base / rel).resolve()
-        if base not in target.parents or not target.is_file() or target.parent.name == "source":
+        if base not in target.parents or not target.is_file() or target.relative_to(base).parts[0] in ("source", "evidence"):
             raise HTTPException(404)
         return PlainTextResponse(target.read_text(errors="replace"))
 
@@ -623,10 +597,18 @@ def create_app(settings: Settings) -> FastAPI:
     @app.get("/feedback/export.jsonl")
     def export_feedback():
         """All feedback as JSON Lines, with the current rule attached (evaluation dataset)."""
-        out = Path(settings.state_dir) / "exports" / "feedback.jsonl"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        store.export_jsonl(out)
-        return FileResponse(out, filename="feedback.jsonl", media_type="application/x-ndjson")
+        tmp = Path(settings.state_dir) / "exports"
+        tmp.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(suffix=".jsonl", dir=tmp)   # one file per request: exports may overlap
+        os.close(fd)
+        out = Path(name)
+        try:
+            store.export_jsonl(out)
+        except BaseException:
+            out.unlink(missing_ok=True)
+            raise
+        return FileResponse(out, filename="feedback.jsonl", media_type="application/x-ndjson",
+                            background=BackgroundTask(out.unlink, missing_ok=True))
 
     @app.get("/api", response_class=HTMLResponse, include_in_schema=False)
     def api_page(request: Request):

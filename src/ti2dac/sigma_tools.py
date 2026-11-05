@@ -109,15 +109,25 @@ def build_detection(draft: SigmaDraft) -> tuple[dict, str]:
     """Structured selections -> Sigma detection mapping. Returns (detection, condition)."""
     detection: dict = {}
     condition = draft.condition.strip()
-    splits: dict[str, list[str]] = {}
+    splits: dict[str, str] = {}   # selection -> expression over the selections it was split into
+    taken = {re.sub(r"[^A-Za-z0-9_]", "_", sel.name) or "selection" for sel in draft.selections}
+
+    def fresh(base: str) -> str:
+        n, out = 2, base
+        while out in taken:
+            out, n = f"{base}_{n}", n + 1
+        taken.add(out)
+        return out
+
     for sel in draft.selections:
         name = re.sub(r"[^A-Za-z0-9_]", "_", sel.name) or "selection"
         if all(not c.field for cl in sel.clauses for c in cl.conditions):
             detection[name] = [v for cl in sel.clauses for c in cl.conditions for v in c.values]
             continue
-        rendered, extra = [], []
+        rendered: list[tuple[dict, list[dict]]] = []
         for cl in sel.clauses:
             m: dict = {}
+            extra: list[dict] = []
             for c in cl.conditions:
                 mods = sorted(set(c.modifiers), key=_MOD_ORDER.index)
                 key = "|".join([c.field, *mods]) if c.field else "|".join(mods)
@@ -127,20 +137,29 @@ def build_detection(draft: SigmaDraft) -> tuple[dict, str]:
                     extra.append({key: val})
                 else:
                     m[key] = val
-            rendered.append(m)
-        detection[name] = rendered[0] if len(rendered) == 1 else rendered
-        if extra:
-            # Same field twice in one AND-clause cannot live in one YAML map: move the extra
-            # conditions to sibling selections that are AND-ed wherever the original is used.
-            splits[name] = []
-            for i, e in enumerate(extra, 2):
-                detection[f"{name}_and{i}"] = e
-                splits[name].append(f"{name}_and{i}")
+            rendered.append((m, extra))
+        plain = [m for m, extra in rendered if not extra]
+        if len(plain) == len(rendered):
+            detection[name] = plain[0] if len(plain) == 1 else plain
+            continue
+        # Same field twice in one AND-clause cannot live in one YAML map: move the extra conditions to sibling
+        # selections AND-ed with that clause only (not with the selection's other OR-ed clauses).
+        parts = []
+        if plain:
+            detection[name] = plain[0] if len(plain) == 1 else plain
+            parts.append(name)
+        for m, extra in (r for r in rendered if r[1]):
+            base = name if not parts and len(rendered) == 1 else fresh(f"{name}_or")
+            detection[base] = m
+            sibs = [fresh(f"{base}_and{i}") for i in range(2, len(extra) + 2)]
+            detection.update(zip(sibs, extra))
+            parts.append("(" + " and ".join([base, *sibs]) + ")")
+        splits[name] = parts[0] if len(parts) == 1 else "(" + " or ".join(parts) + ")"
     if splits:
         # Expand wildcards first so the new siblings cannot be picked up by '1 of x*' (OR) patterns.
-        condition = _expand_wildcards(condition, [n for n in detection if not any(n in v for v in splits.values())])
-        for name, siblings in splits.items():
-            condition = re.sub(rf"\b{re.escape(name)}\b", "(" + " and ".join([name, *siblings]) + ")", condition)
+        names = list(dict.fromkeys(re.sub(r"[^A-Za-z0-9_]", "_", x.name) or "selection" for x in draft.selections))
+        condition = _expand_wildcards(condition, names)
+        condition = re.sub(r"\b(" + "|".join(map(re.escape, splits)) + r")\b", lambda m: splits[m[1]], condition)
     detection["condition"] = condition
     return detection, condition
 

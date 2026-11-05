@@ -6,7 +6,7 @@ Used two ways:
   * `ti2dac replay`: run the rule over real lab telemetry exported as JSON/JSONL/EVTX, which is
     the same idea as Zircolite/Chainsaw and gives a fired/not-fired result before SIEM onboarding.
 
-The rule is converted with pySigma's SQLite backend (Sigma semantics, case-insensitive LIKE) and
+The rule is converted with pySigma's SQLite backend (adjusted below for Sigma semantics) and
 executed over an in-memory table built from the events.
 """
 from __future__ import annotations
@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from functools import lru_cache
 from pathlib import Path
 
 import yaml
@@ -66,11 +67,14 @@ def load_events(path: str | Path) -> list[dict]:
     text = p.read_text(errors="replace").strip()
     if not text:
         return []
-    if text.startswith("["):
-        data = json.loads(text)
-    else:
-        data = [json.loads(line) for line in text.splitlines() if line.strip()]
-    return [normalize_event(e) for e in data if isinstance(e, dict)]
+    try:
+        if text.startswith("["):
+            data = json.loads(text)
+        else:
+            data = [json.loads(line) for line in text.splitlines() if line.strip()]
+        return [normalize_event(e) for e in data if isinstance(e, dict)]
+    except RecursionError as e:
+        raise ReplayError(f"{p.name}: JSON nested too deeply to be a log event export") from e
 
 
 def _load_evtx(p: Path) -> list[dict]:
@@ -127,6 +131,80 @@ def _regexp(pattern, value) -> bool:
         return False
 
 
+@lru_cache(maxsize=1024)
+def _like_re(pattern: str, esc: str | None) -> re.Pattern:
+    out, i = [], 0
+    while i < len(pattern):
+        c = pattern[i]
+        if esc and c == esc and i + 1 < len(pattern):
+            out.append(re.escape(pattern[i + 1].casefold()))
+            i += 2
+            continue
+        out.append(".*" if c == "%" else "." if c == "_" else re.escape(c.casefold()))
+        i += 1
+    return re.compile("".join(out), re.DOTALL)
+
+
+def _like(pattern, value, esc=None):
+    # Replaces SQLite's LIKE, whose case folding is ASCII-only ('ÄÖ' vs 'äö')
+    if pattern is None or value is None:
+        return None
+    return _like_re(pattern, esc).fullmatch(str(value).casefold()) is not None
+
+
+def _casefold_cmp(a: str, b: str) -> int:
+    a, b = a.casefold(), b.casefold()
+    return (a > b) - (a < b)
+
+
+def _num(value):
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _glob_literal(text: str) -> str:
+    return "".join(f"[{c}]" if c in "*?[" else c for c in text)
+
+
+@lru_cache(maxsize=1)
+def _backend_cls():
+    from sigma.types import SpecialChars
+
+    class ReplayBackend(plugins().backends["sqlite"]):
+        """Missing fields are NULL; NULL counts as "no match" everywhere, including under NOT."""
+        field_null_expression = "({field} IS NULL OR {field} = '')"
+        # Values are stored as TEXT: compare numerically only where the rule asks for it
+        compare_op_expression = "sigma_num({field}) {operator} {value}"
+
+        def convert_condition_not(self, cond, state):
+            expr = super().convert_condition_not(cond, state)
+            if isinstance(expr, str) and expr.startswith("NOT "):
+                return f"NOT coalesce({expr[4:]}, 0)"
+            return expr
+
+        def convert_value_re(self, r, state):
+            return super().convert_value_re(r, state).replace("'", "''")
+
+        def convert_condition_field_eq_val_str_case_sensitive(self, cond, state):
+            # The stock rendering uses `GLOB ... ESCAPE`, which SQLite rejects; GLOB escapes via [x]
+            parts = []
+            for p in cond.value.s:
+                if isinstance(p, str):
+                    parts.append(_glob_literal(p))
+                elif p == SpecialChars.WILDCARD_MULTI:
+                    parts.append("*")
+                elif p == SpecialChars.WILDCARD_SINGLE:
+                    parts.append("?")
+                else:
+                    raise NotImplementedError(f"unsupported value part in cased match: {p!r}")
+            pattern = "".join(parts).replace("'", "''")
+            return f"{self.escape_and_quote_field(cond.field)} GLOB '{pattern}'"
+
+    return ReplayBackend
+
+
 def evaluate(rule_yaml: str, events: list[dict]) -> list[int]:
     """Indices of `events` matched by the rule's detection (correlation thresholds are not applied)."""
     from sigma.collection import SigmaCollection
@@ -134,7 +212,7 @@ def evaluate(rule_yaml: str, events: list[dict]) -> list[int]:
     base = _first_doc(rule_yaml)
     base_only = yaml.safe_dump(base, sort_keys=False)
     try:
-        sql = plugins().backends["sqlite"]().convert(SigmaCollection.from_yaml(base_only))[0]
+        sql = _backend_cls()().convert(SigmaCollection.from_yaml(base_only))[0]
     except KeyError as e:
         raise ReplayError("pySigma SQLite backend not installed (pip install 'pySigma-backend-sqlite==0.2.0')") from e
     except Exception as e:
@@ -154,13 +232,11 @@ def evaluate(rule_yaml: str, events: list[dict]) -> list[int]:
     cols = sorted(set(canon.values())) + ["__idx"]
     rows = []
     for i in idx:
-        # Missing fields are '' rather than NULL: with NULL, SQL three-valued logic turns
-        # `NOT ParentImage LIKE ...` into NULL and silently drops events that lack the field,
-        # whereas in Sigma a filter on an absent field simply does not match. (Trade-off: `field: null`
-        # checks are not supported by local replay.)
-        row = {c: "" for c in cols}
+        # Missing fields stay NULL (`field: null`, `|exists`); the backend wraps NOT in coalesce() so
+        # `not filter` on an absent field still keeps the event.
+        row: dict = {c: None for c in cols}
         for k, v in events[i].items():
-            if k and v not in (None, "") and row[canon[k.lower()]] == "":
+            if k and v is not None and row[canon[k.lower()]] in (None, ""):
                 row[canon[k.lower()]] = str(v)
         row["__idx"] = i
         rows.append([row[c] for c in cols])
@@ -169,9 +245,13 @@ def evaluate(rule_yaml: str, events: list[dict]) -> list[int]:
     conn = sqlite3.connect(":memory:")
     try:
         conn.create_function("REGEXP", 2, lambda p, v: _regexp(p, v))
-        # NUMERIC affinity: '4698' is stored as 4698, so `EventID = 4698` and `>`/`<` compare as numbers;
-        # NOCASE: Sigma string comparison is case-insensitive (LIKE already is; '=' needs the collation).
-        conn.execute("CREATE TABLE logs (" + ", ".join(f'"{c}" NUMERIC COLLATE NOCASE' for c in cols) + ")")
+        conn.create_function("like", 2, _like)
+        conn.create_function("like", 3, _like)
+        conn.create_function("sigma_num", 1, _num)
+        conn.create_collation("SIGMA", _casefold_cmp)
+        # TEXT keeps '0012'/'1e5' verbatim; numeric literals in `EventID=4698` take TEXT affinity too.
+        # SIGMA collation: Unicode-aware case-insensitive '=' (Sigma's default).
+        conn.execute("CREATE TABLE logs (" + ", ".join(f'"{c}" TEXT COLLATE SIGMA' for c in cols) + ")")
         conn.executemany("INSERT INTO logs VALUES (" + ",".join("?" * len(cols)) + ")", rows)
         return sorted(int(r[0]) for r in conn.execute(query))
     except sqlite3.Error as e:

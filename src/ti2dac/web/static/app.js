@@ -129,6 +129,13 @@
     });
   }
 
+  // forms that throw work away ask first (registered before data-busy, which skips prevented submits)
+  $$("form[data-confirm]").forEach(function (f) {
+    f.addEventListener("submit", function (e) {
+      if (!window.confirm(f.getAttribute("data-confirm"))) e.preventDefault();
+    });
+  });
+
   // buttons that start long work show a spinner and block double submits
   $$("form[data-busy]").forEach(function (f) {
     f.addEventListener("submit", function (e) {
@@ -220,17 +227,40 @@
         statusEl.appendChild(document.createTextNode(j.status));
       }
       if (errEl && j.error) { errEl.hidden = false; errEl.querySelector("[data-msg]").textContent = j.error; }
+      var stopForm = job.querySelector("[data-job-stop]");
+      if (stopForm && !running) stopForm.hidden = true;
+    }
+    var live = job.querySelector("[data-job-live]");
+    var delay = 1500;
+    function stop(msg) {
+      if (!live) return;
+      if (msg) live.textContent = msg; else live.hidden = true;
     }
     (function poll() {
       fetch("/api/jobs/" + encodeURIComponent(id), { headers: { Accept: "application/json" }, credentials: "same-origin" })
-        .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+        .then(function (r) {
+          if (r.status >= 400 && r.status < 500) {   // retrying cannot fix these
+            var e = new Error(r.status); e.final = true; throw e;
+          }
+          if (!r.ok) throw new Error(r.status);
+          return r.json();
+        })
         .then(function (j) {
+          delay = 1500;
           render(j);
           if (j.status === "done" && j.run_id) { location.href = "/runs/" + encodeURIComponent(j.run_id); return; }
-          if (j.status === "running") setTimeout(poll, 1500);
-          else { var spin = job.querySelector("[data-job-live]"); if (spin) spin.hidden = true; }
+          if (j.status === "running") setTimeout(poll, delay);
+          else stop();
         })
-        .catch(function () { setTimeout(poll, 4000); });
+        .catch(function (e) {
+          if (e && e.final) {
+            stop(e.message === "401" ? "stopped updating: signed out, reload the page to sign in" :
+              e.message === "404" ? "stopped updating: this job no longer exists" : "stopped updating (HTTP " + e.message + "); reload the page");
+            return;
+          }
+          delay = Math.min(delay * 2, 30000);   // server or network trouble: back off
+          setTimeout(poll, delay);
+        });
     })();
   }
 })();

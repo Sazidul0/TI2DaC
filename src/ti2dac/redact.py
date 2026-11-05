@@ -27,13 +27,15 @@ _SECRET_FLAG = re.compile(r"(?i)((?:^|\s)-p)(?!ass|ath|ort|rofile|roc|olicy|\s)(
 _SECRET_TOKENS = re.compile(
     r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b|\beyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,}\b|\bgh[pousr]_[A-Za-z0-9]{30,}\b"
     r"|\bxox[abpr]-[A-Za-z0-9-]{10,}\b|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z ]*PRIVATE KEY-----")
-_EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+# Matches start only at the beginning of a run (like \b, after at most three leading symbols, e.g. "...a@b.com"):
+# from every \b inside a long run the scan is repeated, quadratic on whole-report text.
+_EMAIL = re.compile(r"(?:(?<![\w.%+-])|(?<=(?<![\w.%+-])[.%+-])|(?<=(?<![\w.%+-])[.%+-]{2})|(?<=(?<![\w.%+-])[.%+-]{3}))(?=\w)[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _SID = re.compile(r"\bS-1-5-21-\d{6,10}-\d{6,10}-\d{6,10}(?:-\d{3,})?\b")
 _IPV4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
 _PROFILE = re.compile(r"(?i)((?:[a-z]:)?\\{1,2}Users\\{1,2}|/home/|/Users/)([^\\/\s\"'<>|:*?]+)")
 _DOMAIN_USER = re.compile(r"\b([A-Z][A-Z0-9-]{1,14})\\{1,2}([A-Za-z][\w.$-]{1,30})\b")
 _INTERNAL_TLD = r"(?:local|lan|internal|intranet|intra|corp|lcl|ad|home|localdomain)"
-_FQDN = re.compile(r"\b((?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+)\b")
+_FQDN = re.compile(r"(?:(?<![\w-])|(?<=(?<![\w-])-)|(?<=(?<![\w-])--))(?=\w)((?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+)\b")
 _HOSTLIKE = re.compile(r"\b[A-Z]{2,6}-[A-Z]{1,6}\d{0,3}-\d{1,5}\b")   # FIN-WS-0231, NYC-DC-01 (two-segment schemes)
 _UNC = re.compile(r"(?:(?<=^)|(?<=[\s\"'(=,>|]))(\\\\(?:\\\\)?)([A-Za-z0-9][\w-]{0,62}(?:\.[\w-]+)*)(?=\\)", re.M)   # \\server\ only
 _PERSON = re.compile(r"(?<![\w.@\[\\/%-])([a-z])\.([a-z]{4,20})(?![\w@\]\\/-])")
@@ -69,10 +71,17 @@ class Redaction:
 
 
 class _Pseudonymizer:
-    def __init__(self) -> None:
+    def __init__(self, known: dict[str, str] | None = None) -> None:
         self.forward: dict[tuple[str, str], str] = {}
         self.mapping: dict[str, str] = {}
         self.counts: dict[str, int] = {}
+        self.last: dict[str, int] = {}
+        for ph, value in (known or {}).items():   # an earlier pass (the run's report): same placeholders
+            m = re.fullmatch(r"\[([A-Z]+)_(\d+)\]", ph)
+            if m and isinstance(value, str):
+                self.forward.setdefault((m[1], value.lower()), ph)
+                self.mapping[ph] = value
+                self.last[m[1]] = max(self.last.get(m[1], 0), int(m[2]))
 
     def __call__(self, kind: str, value: str) -> str:
         if kind == "SECRET":   # never keep a reversible map of secrets
@@ -80,7 +89,7 @@ class _Pseudonymizer:
             return "[SECRET]"
         key = (kind, value.lower())
         if key not in self.forward:
-            n = sum(1 for k in self.forward if k[0] == kind) + 1
+            n = self.last[kind] = self.last.get(kind, 0) + 1
             ph = f"[{kind}_{n}]"
             self.forward[key] = ph
             self.mapping[ph] = value
@@ -100,8 +109,10 @@ def _is_internal_ip(s: str, networks: list) -> bool:
 
 def redact(text: str, *, internal_domains: list[str] | None = None, internal_networks: list[str] | None = None,
            terms: list[str] | None = None, hostname_patterns: list[str] | None = None,
-           netbios_domains: list[str] | None = None) -> Redaction:
-    p = _Pseudonymizer()
+           netbios_domains: list[str] | None = None, known: dict[str, str] | None = None) -> Redaction:
+    """`known`: placeholder map of an earlier pass; its values are replaced wherever they appear (even where the
+    patterns would not find them, e.g. a host learned from a log field) and new finds are numbered after it."""
+    p = _Pseudonymizer(known)
     nets = [ipaddress.ip_network(n, strict=False) for n in (internal_networks or [])]
     domains = [d.lower().lstrip(".") for d in (internal_domains or [])]
 
@@ -110,6 +121,9 @@ def redact(text: str, *, internal_domains: list[str] | None = None, internal_net
     text = _SECRET_KV.sub(lambda m: m.group(1) + p("SECRET", m.group(2)), text)
     text = _SECRET_VAR.sub(lambda m: m.group(1) + '"' + p("SECRET", m.group(2)) + '"', text)
     text = _SECRET_FLAG.sub(lambda m: m.group(1) + p("SECRET", m.group(2)), text)
+    for (kind, low), ph in sorted(p.forward.items(), key=lambda kv: len(kv[0][1]), reverse=True):
+        if len(low) >= 3:
+            text = re.sub(rf"(?<![\w\[-]){re.escape(low)}(?![\w\]-])", ph, text, flags=re.I)
 
     # 2. configured organisation / customer names
     for term in sorted(terms or [], key=len, reverse=True):
@@ -218,3 +232,12 @@ def detect_tlp(text: str) -> str:
 
 def tlp_allowed(tlp: str, allowed: list[str]) -> bool:
     return tlp in allowed
+
+
+def lesson_tlps(run_tlp: str, allowed: list[str]) -> list[str]:
+    """TLP markings of lessons that may go into this run's prompts: no stricter than the run itself (whose
+    TLP already passed policy, also for failover) and allowed for the provider."""
+    run_tlp = (run_tlp or "").lower()
+    if run_tlp not in TLP_ORDER:
+        return []
+    return [t for t in TLP_ORDER[:TLP_ORDER.index(run_tlp) + 1] if tlp_allowed(t, allowed)]

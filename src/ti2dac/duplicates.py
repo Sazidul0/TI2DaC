@@ -42,16 +42,17 @@ def _tokens(doc: dict) -> set[str]:
 
 
 def _logsource_key(doc: dict) -> str:
-    ls = doc.get("logsource") or {}
+    ls = doc.get("logsource") if isinstance(doc.get("logsource"), dict) else {}
     return f"{ls.get('product', '')}:{ls.get('category') or ls.get('service', '')}"
 
 
 def _techniques(doc: dict) -> set[str]:
-    return {t.lower() for t in doc.get("tags") or [] if re.fullmatch(r"attack\.t\d{4}(\.\d{3})?", str(t).lower())}
+    tags = doc.get("tags") if isinstance(doc.get("tags"), list) else []
+    return {str(t).lower() for t in tags if re.fullmatch(r"attack\.t\d{4}(\.\d{3})?", str(t).lower())}
 
 
 def _entry(doc: dict, path: str) -> dict | None:
-    if not isinstance(doc, dict) or "detection" not in doc:
+    if not isinstance(doc, dict) or not isinstance(doc.get("detection"), dict):   # malformed repo rules are skipped
         return None
     return {"id": str(doc.get("id", "")), "title": str(doc.get("title", "")), "path": path,
             "ls": _logsource_key(doc), "tech": sorted(_techniques(doc)), "tok": sorted(_tokens(doc))}
