@@ -250,6 +250,10 @@ class IOCSet(BaseModel):
     file_paths: list[str] = []
     registry_keys: list[str] = []
     file_names: list[str] = []       # executable/script names mentioned (used to spot brittle rules)
+    mutexes: list[str] = []
+    # Values found in the text but not indicators (keys, IDs, lab/reserved addresses, legitimate services and
+    # system files), with the reason; kept so an analyst can see what was left out and why.
+    excluded: dict[str, str] = {}
 
 
 class Behaviour(ExtractedBehaviour):

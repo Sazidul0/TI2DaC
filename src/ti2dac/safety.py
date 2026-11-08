@@ -37,6 +37,8 @@ WARN_RULES: list[tuple[str, re.Pattern]] = [
     ("account-creation", re.compile(r"\bnet1?\s+user\s+\S+\s+\S*\s*/add|New-LocalUser|\buseradd\b|\badduser\b", re.I)),
     ("privilege-change", re.compile(r"\bnet1?\s+localgroup\s+administrators\b.*/add|Add-LocalGroupMember|usermod\s+-aG\s+(sudo|wheel)", re.I)),
     ("reboot", re.compile(r"\bshutdown(\.exe)?\s|Restart-Computer|\breboot\b", re.I)),
+    # Reversible (reagentc /enable), so the simulation may do it for the rule's command line; review it anyway.
+    ("recovery-tamper", re.compile(r"\breagentc(\.exe)?\s+[/-]disable\b", re.I)),
     ("process-kill", re.compile(r"taskkill\s+.*/im\s+(?!notepad|calc)|Stop-Process\s+-Name\s+(?!notepad|calc)|\bpkill\b|\bkillall\b", re.I)),
 ]
 _DOWNLOAD = re.compile(
@@ -51,10 +53,42 @@ _ENC = re.compile(r"-(?:e|ec|en|enc|enco|encod|encode|encoded|encodedc\w*)\s+([A
 PERSISTENCE_PAIRS = [
     (re.compile(r"schtasks(\.exe)?\s+/create|Register-ScheduledTask|New-ScheduledTask", re.I), re.compile(r"schtasks(\.exe)?\s+/delete|Unregister-ScheduledTask", re.I), "scheduled task"),
     (re.compile(r"\bsc(\.exe)?\s+create\b|New-Service", re.I), re.compile(r"\bsc(\.exe)?\s+delete\b|Remove-Service|Delete\(\)", re.I), "service"),
-    (re.compile(r"\breg(\.exe)?\s+add\b|New-ItemProperty|Set-ItemProperty", re.I), re.compile(r"\breg(\.exe)?\s+delete\b|Remove-ItemProperty|Remove-Item", re.I), "registry value"),
+    # Removing a temp file is not removing the value: Remove-Item only counts on a registry path.
+    (re.compile(r"\breg(\.exe)?\s+add\b|New-ItemProperty|Set-ItemProperty", re.I),
+     re.compile(r"\breg(\.exe)?\s+delete\b|Remove-ItemProperty|Remove-Item\s+.*(HK(LM|CU|CR|U|EY_\w+):|Registry::)", re.I),
+     "registry value"),
+    (re.compile(r"\breagentc(\.exe)?\s+[/-]disable\b", re.I), re.compile(r"\breagentc(\.exe)?\s+[/-]enable\b", re.I),
+     "disabled Windows Recovery Environment"),
     (re.compile(r"\bnet1?\s+user\s+\S+.*?/add|New-LocalUser|\buseradd\b", re.I), re.compile(r"\bnet1?\s+user\s+\S+\s+/del|Remove-LocalUser|\buserdel\b", re.I), "local account"),
     (re.compile(r"crontab\s+(-l.*\|\s*)?|/etc/cron", re.I), re.compile(r"crontab\s+-r|crontab\s+-l.*grep\s+-v|sed\s+-i.*cron|rm\s+.*cron", re.I), "cron entry"),
     (re.compile(r"systemctl\s+enable|/etc/systemd/system/", re.I), re.compile(r"systemctl\s+disable|rm\s+.*systemd", re.I), "systemd unit"),
+    # Security and system state the warn rules allow (for the rule's command line) must be put back as well.
+    (re.compile(r"Add-MpPreference\s+.*-Exclusion\w*", re.I), re.compile(r"Remove-MpPreference\s+.*-Exclusion\w*", re.I),
+     "Defender exclusion"),
+    (re.compile(r"Set-MpPreference\s+.*-Disable\w+\s+(\$true|1)\b", re.I),
+     re.compile(r"Set-MpPreference\s+.*-Disable\w+\s+(\$false|0)\b", re.I), "disabled Defender setting"),
+    (re.compile(r"netsh\s+(adv)?firewall\s+.*\b(state\s+off|opmode\s+disable)|Set-NetFirewallProfile\s+.*-Enabled\s+"
+                r"(False|\$false|0)\b|\bufw\s+disable", re.I),
+     re.compile(r"netsh\s+(adv)?firewall\s+.*\b(state\s+on|opmode\s+enable)|Set-NetFirewallProfile\s+.*-Enabled\s+"
+                r"(True|\$true|1)\b|\bufw\s+enable", re.I), "disabled firewall"),
+    (re.compile(r"netsh\s+advfirewall\s+firewall\s+add\s+rule|New-NetFirewallRule", re.I),
+     re.compile(r"netsh\s+advfirewall\s+firewall\s+delete\s+rule|Remove-NetFirewallRule", re.I), "firewall rule"),
+    (re.compile(r"\bnet1?\s+localgroup\s+\S+.*?/add|Add-LocalGroupMember|usermod\s+-a?G", re.I),
+     re.compile(r"\bnet1?\s+localgroup\s+\S+.*?/del|Remove-LocalGroupMember|gpasswd\s+-d|\bdeluser\s+\S+\s+\S+", re.I),
+     "group membership"),
+    (re.compile(r"__EventFilter|CommandLineEventConsumer|ActiveScriptEventConsumer|__FilterToConsumerBinding", re.I),
+     re.compile(r"Remove-WmiObject|Remove-CimInstance|\.Delete\(\)", re.I), "WMI event subscription"),
+    (re.compile(r"\\Start Menu\\Programs\\Startup\b|shell:startup|\[Environment\]::GetFolderPath\(['\"]Startup", re.I),
+     re.compile(r"(Remove-Item|\bdel\b|\berase\b).*(Startup|\$startup)", re.I), "Startup-folder file"),
+    (re.compile(r"auditpol(\.exe)?\s+/set\s+.*:disable", re.I), re.compile(r"auditpol(\.exe)?\s+(/set\s+.*:enable|/restore)", re.I),
+     "disabled audit policy"),
+    (re.compile(r"\bsc(\.exe)?\s+config\s+\S+\s+start=\s*disabled|Set-Service\s+.*-StartupType\s+Disabled", re.I),
+     re.compile(r"\bsc(\.exe)?\s+config\s+\S+\s+start=\s*(auto|demand|delayed-auto)|Set-Service\s+.*-StartupType\s+"
+                r"(Automatic|Manual)", re.I), "disabled service"),
+    (re.compile(r">>\s*\S*authorized_keys", re.I), re.compile(r"authorized_keys", re.I), "SSH authorized key"),
+    (re.compile(r">>\s*\S*(\.bashrc|\.bash_profile|\.profile|\.zshrc)\b", re.I),
+     re.compile(r"(sed\s+-i|grep\s+-v|cp\s+\S+\s+\S*|mv\s+\S+\s+\S*)\S*(\.bashrc|\.bash_profile|\.profile|\.zshrc)", re.I),
+     "shell profile line"),
 ]
 
 
@@ -109,8 +143,39 @@ def lint_script(script: str, cleanup: str = "") -> list[LintFinding]:
     for created, removed, what in PERSISTENCE_PAIRS:
         if created.search(script) and not removed.search(cleanup):
             findings.append(LintFinding(severity="warn", rule="missing-cleanup", line=0,
-                                        text=f"simulate creates a {what} but cleanup does not remove it"))
+                                        text=f"cleanup does not undo the {what} that simulate creates or changes"))
+    findings += _unconditional_restore(script, cleanup)
     return findings
+
+
+_STATE_TOGGLES = [   # (simulate turns it off, cleanup turns it on, what)
+    (re.compile(r"\breagentc(\.exe)?\s+[/-]disable\b", re.I), re.compile(r"\breagentc(\.exe)?\s+[/-]enable\b", re.I),
+     "Windows Recovery Environment"),
+    (re.compile(r"Set-MpPreference\s+.*-Disable\w+\s+(\$true|1)\b", re.I),
+     re.compile(r"Set-MpPreference\s+.*-Disable\w+\s+(\$false|0)\b", re.I), "Defender setting"),
+    (re.compile(r"netsh\s+(adv)?firewall\s+.*\bstate\s+off|Set-NetFirewallProfile\s+.*-Enabled\s+(False|\$false|0)\b", re.I),
+     re.compile(r"netsh\s+(adv)?firewall\s+.*\bstate\s+on|Set-NetFirewallProfile\s+.*-Enabled\s+(True|\$true|1)\b", re.I),
+     "firewall"),
+    (re.compile(r"auditpol(\.exe)?\s+/set\s+.*:disable", re.I), re.compile(r"auditpol(\.exe)?\s+/set\s+.*:enable", re.I),
+     "audit policy"),
+]
+
+
+def _unconditional_restore(script: str, cleanup: str) -> list[LintFinding]:
+    """Cleanup that re-enables a setting must check the state saved before the test: a lab VM where it was already
+    off would otherwise be left changed. A restore line with no `if` on it or just above it is unconditional."""
+    out = []
+    lines = cleanup.splitlines()
+    for off, on, what in _STATE_TOGGLES:
+        if not off.search(script):
+            continue
+        for i, ln in enumerate(lines):
+            if on.search(ln) and not any(re.search(r"\bif\b", x, re.I) for x in lines[max(0, i - 2):i + 1]):
+                out.append(LintFinding(severity="warn", rule="unconditional-restore", line=i + 1,
+                                       text=f"cleanup restores the {what} without checking its state before the test; "
+                                            "if it was already off, cleanup changes the VM. Save the prior state in "
+                                            "simulate and restore only that."))
+    return out
 
 
 def lab_guard(language: str) -> str:

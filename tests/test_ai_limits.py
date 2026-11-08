@@ -336,3 +336,42 @@ def test_quota_message_keeps_limit_and_model(settings, gemini):
         _ask(gemini([_gemini_429(msg, retry="120s")]))
     assert "quota of 20 requests per day for gemini-3.8-flash used up (free tier)" in str(e.value)
     assert "https://" not in str(e.value) and len(str(e.value)) < 300
+
+
+def test_schema_too_large_for_a_grammar_is_asked_as_plain_json(settings, monkeypatch):
+    # Live failure (claude-sonnet-5-5, DetectionDraft): 400 "The compiled grammar is too large ..." on every rule
+    from ti2dac import llm as llm_mod
+
+    monkeypatch.setattr(llm_mod, "_NO_GRAMMAR", set())
+    sent = []
+    outcomes = [_anthropic_error(anthropic.BadRequestError, 400, "The compiled grammar is too large, which would cause "
+                                 "performance issues. Simplify your tool schemas or reduce the number of strict tools."),
+                _msg(text=f"Here is the rule:\n```json\n{OK_JSON}\n```"), _msg()]
+
+    class Stream:
+        def __init__(self, out):
+            self.out = out
+
+        def __enter__(self):
+            if isinstance(self.out, Exception):
+                raise self.out
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get_final_message(self):
+            return self.out
+
+    def stream(**kw):
+        sent.append(kw)
+        return Stream(outcomes.pop(0))
+
+    llm = LLM(settings)
+    llm._client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(stream=stream)))
+    assert _ask(llm).query == "q"
+    assert "format" in sent[0]["output_config"]
+    assert "format" not in sent[1].get("output_config", {}) and '"query"' in sent[1]["system"][0]["text"]
+    assert llm.usage.schema_retries == 0
+    _ask(llm, 1)   # remembered: no second rejected request
+    assert len(sent) == 3 and "format" not in sent[2].get("output_config", {})

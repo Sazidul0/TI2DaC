@@ -87,8 +87,8 @@ def _status_label(p: DetectionPackage, results: list[dict]) -> dict[str, str]:
             labels[q.target] = tested
         elif q.error:
             err = q.error.lower()
-            labels[q.target] = ("unsupported logsource" if "does not support logsource" in err
-                                else "unsupported field" if "field" in err or "support" in err else "conversion-failed")
+            labels[q.target] = ("conversion-failed" if st.conversion_problem(q.error) == "failed"
+                                else "unsupported logsource" if "logsource" in err else "unsupported field")
         elif q.method == "llm":
             labels[q.target] = "ai-translated (unverified)"
         elif "Backend warning" in q.notes:
@@ -291,8 +291,9 @@ def _atomic_yaml(p: DetectionPackage) -> str | None:
             "executor": {
                 "name": executor,
                 "elevation_required": sim.privileges == "admin",
-                "command": sim.simulate.strip() + "\n",
-                "cleanup_command": sim.cleanup.strip() + "\n",
+                # Invoke-AtomicTest runs these directly, not simulate.ps1: they need the same lab guard.
+                "command": safety.lab_guard(sim.language) + sim.simulate.strip() + "\n",
+                "cleanup_command": safety.lab_guard(sim.language) + sim.cleanup.strip() + "\n",
             },
         }],
     }
@@ -453,9 +454,10 @@ def _write_validation(record: RunRecord, out: Path, results: list[dict]) -> None
         st = _status_label(p, results)
         fp_total = sum(target_status(results, t, p.version)[1] for t in tids)
         causes = sorted({c for t in tids for c in target_status(results, t, p.version)[2]})
+        tested = any(r["slug"] == p.slug and r["rule_version"] == p.version for r in results)
         L.append(f"| {p.slug} | v{p.version} | {p.behaviour.technique_id} | {p.sigma_status} | {p.selftest} | {p.review_status} | "
                  + " | ".join(_cell(st.get(t, "-")) for t in tids)
-                 + f" | {fp_total}{' (' + _cell('; '.join(causes)) + ')' if causes else ''} |")
+                 + f" | {fp_total if tested else '-'}{' (' + _cell('; '.join(causes)) + ')' if causes else ''} |")   # 0 would claim a test
     L += ["", "## Recorded test evidence", ""]
     if results:
         L += ["| When | Rule | Ver | Target | Result | FP | Evidence | By |", "|---|---|---|---|---|---|---|---|"]
@@ -538,7 +540,9 @@ def _write_summary(record: RunRecord, out: Path, results: list[dict]) -> None:
     i = record.iocs
     L += ["", "## IOCs (enrichment only, see iocs.json)", "",
           f"{len(i.ipv4)} IPv4 · {len(i.domains)} domains · {len(i.urls)} URLs · {len(i.md5) + len(i.sha1) + len(i.sha256)} hashes · "
-          f"{len(i.cves)} CVEs ({', '.join(i.cves[:8])})", ""]
+          f"{len(i.mutexes)} mutexes · {len(i.cves)} CVEs" + (f" ({', '.join(i.cves[:8])})" if i.cves else "")
+          + (f" · {len(i.excluded)} values left out as not indicators (keys, IDs, lab addresses, legitimate services "
+             "and system files; listed with the reason under `excluded`)" if i.excluded else ""), ""]
     items = [f"- {w}" for w in record.warnings]
     for p in record.packages:
         items += [f"- **{p.slug} quality:** {x}" for x in p.quality_warnings]

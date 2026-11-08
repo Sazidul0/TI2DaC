@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import tempfile
 import time
 import uuid
@@ -40,6 +41,7 @@ from ..config import STAGES, Settings, env_file, env_source, set_env_secret
 from ..feedback import ARTIFACTS, CATEGORIES, REVIEW_STATES, SEVERITIES, TEST_RESULTS, Store, target_status
 from ..llm import LLM, verify_key
 from ..render import load_record, rule_filename
+from ..sigma_tools import conversion_problem
 from ..targets import LLM_TARGET_LABELS, TARGETS
 from ..users import Users
 from . import jobs as jobs_mod
@@ -208,7 +210,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     # ------------------------------------------------------------------ pages
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-    def index(request: Request):
+    def index(request: Request, deleted: str = ""):
         runs = store.list_runs()[:100]
         for r in runs:   # per-run AI usage and rule counts from the run record
             try:
@@ -217,6 +219,7 @@ def create_app(settings: Settings) -> FastAPI:
                 data = {}
             pkgs = data.get("packages") or []
             r["usage"] = data.get("usage") or {}
+            r["created_by"] = data.get("created_by") or ""
             r["behaviours"] = len(data.get("behaviours") or [])
             r["rules"] = len(pkgs)
             r["approved"] = sum(p.get("review_status") == "approved" for p in pkgs)
@@ -224,7 +227,7 @@ def create_app(settings: Settings) -> FastAPI:
             r["tlp"] = (data.get("report") or {}).get("tlp_effective", "")
         siems = [(TARGETS[t].label, TARGETS[t].language, False) for t in settings.targets if t in TARGETS]
         siems += [(*LLM_TARGET_LABELS.get(t, (t, "")), True) for t in settings.llm_targets]
-        return TEMPLATES.TemplateResponse(request, "index.html", ctx(request, runs=runs, jobs=store.list_jobs(5),
+        return TEMPLATES.TemplateResponse(request, "index.html", ctx(request, runs=runs, jobs=store.list_jobs(5), deleted=deleted,
                                                                      siems=siems))
 
     @app.post("/runs")
@@ -255,7 +258,7 @@ def create_app(settings: Settings) -> FastAPI:
         job = store.get_job(jid)
         if job is None:
             raise HTTPException(404, "unknown job")
-        if job["status"] == "done" and job["run_id"]:
+        if job["status"] == "done" and job["run_id"] and store.run_path(job["run_id"]):   # the run may be deleted
             return RedirectResponse(f"/runs/{job['run_id']}", 303)
         return TEMPLATES.TemplateResponse(request, "job.html", ctx(request, job=job, can_stop=jobs.can_stop(jid)))
 
@@ -281,7 +284,7 @@ def create_app(settings: Settings) -> FastAPI:
         record = load_record(path)
         results = store.test_results(run_id)
         status = {p.slug: {q.target: (target_status(results, q.target, p.version)[0] or
-                                      ("failed" if q.error else "not-tested")) for q in p.queries}
+                                      (conversion_problem(q.error) if q.error else "not-tested")) for q in p.queries}
                   for p in record.packages}
         return TEMPLATES.TemplateResponse(request, "run.html", ctx(
             request, r=record, status=status, results=results, feedback=store.list_feedback(run_id),
@@ -292,6 +295,24 @@ def create_app(settings: Settings) -> FastAPI:
             ads={p.slug: (path / "documentation" / f"{p.slug}-ads.md").read_text()
                  for p in record.packages if (path / "documentation" / f"{p.slug}-ads.md").is_file()},
         ))
+
+    @app.post("/runs/{run_id}/delete")
+    def delete_run(request: Request, run_id: str):
+        """Delete a run: its output folder (rules, queries, source report), feedback, test results and the
+        lessons learned from it. Admins, or the user who created the run. Cannot be undone."""
+        path = run_dir(run_id)
+        record = load_record(path)
+        if request.state.role != "admin" and request.state.user != record.created_by:
+            raise HTTPException(403, "only an admin or the user who created this run can delete it")
+        if store.running_jobs_for(run_id):
+            raise HTTPException(409, "a job is still working on this run; wait for it or stop it first")
+        root = Path(settings.output_dir).resolve()
+        if root not in path.resolve().parents:   # the registry's path must not point outside the output folder
+            raise HTTPException(409, f"run folder {path} is outside the output folder; delete it by hand")
+        with run_lock(run_id):
+            store.delete_run(run_id, request.state.user)
+            shutil.rmtree(path, ignore_errors=True)
+        return RedirectResponse("/?deleted=" + run_id, 303)
 
     @app.post("/runs/{run_id}/generate")
     def generate_more(request: Request, run_id: str, select: str = Form(...)):

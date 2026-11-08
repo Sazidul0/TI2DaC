@@ -246,7 +246,7 @@ Two things to know about Gemini:
 AI output is treated as an untrusted draft. Each check below runs on every rule:
 
 - **Evidence verification:** every quote is matched against the source. A behaviour with no verifiable quote is flagged as a possible hallucination and never auto-selected.
-- **ATT&CK verification:** technique IDs are checked against a local index of MITRE ATT&CK v20 (refresh with `ti2dac attack-update`). Invalid, revoked or deprecated IDs are flagged and wrong tactics corrected. Self-reported reproducibility is capped for techniques that cannot be simulated safely (credential dumping, destruction).
+- **ATT&CK verification:** technique IDs are checked against a local index of MITRE ATT&CK v20 (refresh with `ti2dac attack-update`). Invalid, revoked or deprecated IDs are flagged and wrong tactics corrected. A revoked ID is replaced by its successor (e.g. T1562.001 → T1685 *Disable or Modify Tools*, tactic defense-impairment). Self-reported reproducibility is capped for techniques that cannot be simulated safely (credential dumping, destruction).
 - **Sigma validation:** pySigma parsing and validators (the `sigma check` set), plus conversion by every backend.
 - **Self-test:** the rule must match the event its own simulation produces and must not match benign look-alikes. A failure triggers a repair.
 - **Brittleness:** a rule that depends on artifact names from this one intrusion (e.g. `socks32.exe`) is flagged and generalised, because attackers rename such files for free.
@@ -399,6 +399,7 @@ or keys (anything shaped like an API key is replaced with `[SECRET]`).
 |---|---|---|
 | `ai.call` | every AI request: `stage`, `provider`, `model`, `served_by`, `outcome` (ok, cached, refused, outage, truncated, error, paused, rate_limited, quota_exhausted, auth_error), `latency_ms`, tokens, `cost_usd` | AI request and token/cost metrics |
 | `ai.failover`, `ai.schema_retry` | failover to the second provider; a corrective re-ask | provider outage alerts |
+| `ai.unconstrained` | Anthropic could not compile a schema into an output grammar ("compiled grammar is too large"); that model and schema are then asked for plain JSON, validated by ti2dac | schema-size tracking |
 | `run.finish`, `run.failed`, `rule.failed` | each pipeline run, with rule counts, tokens and cost | failed-run alerts |
 | `job.start`, `job.finish`, `job.stopped` | web background jobs, with status and duration; `job.stopped` when a job was stopped by a user, hit `jobs.timeout_minutes` or its worker died | job monitoring |
 | `audit` | every audit entry (`action`, `actor`, `details`), including `auth.failed` (wrong login), `access.denied` (role not allowed) and `csrf.refused` (cross-site request), at warning level | security monitoring |
@@ -445,7 +446,7 @@ output/<run-id>/
   report-summary.md            summary, provenance (AI provider/models, who ran it, TLP, redactions), detections, warnings, AI usage
   behaviour-analysis.yaml      all behaviours with evidence (verified flags), scores, ATT&CK checks
   telemetry-requirements.yaml  log sources, event IDs, key fields, audit-policy needs, blind spots
-  iocs.json                    IOCs for enrichment (never used as rule logic)
+  iocs.json                    IOCs for enrichment (never used as rule logic); `excluded` lists values left out (keys, IDs, lab/reserved IPs, legitimate services, Windows files) with the reason
   rules/rule-001-*.yml         Sigma rule; threshold rules include a second document (Sigma correlation); history/ = old versions
   tests/rule-001.json          rule unit-test events
   queries/rule-001/            one file per SIEM + README with all queries and the field-mapping table
@@ -474,7 +475,7 @@ output/<run-id>/
 | `ai-status [--reset]` | AI provider health: key configured, limits hit, requests today; clear a pause |
 | `health [--json]` | Database, disk space, AI provider and stuck jobs; exit code 1 when a check fails |
 | `model [<id>] [--provider P] [--stage S] [--refresh]` | List or choose the provider and model (same setting as the web AI page) |
-| `render <run> [--recheck]` | Rebuild a package; `--recheck` re-runs validation, conversion, self-tests and the safety lint with the current version (no AI, no tokens) |
+| `render <run> [--recheck]` | Rebuild a package; `--recheck` re-runs validation, conversion, self-tests, the safety lint, IOC extraction and the ATT&CK check with the current version, and re-checks kept AI translations (no AI, no tokens) |
 | `lint-sim`, `targets`, `runs`, `attack-update` | Utilities |
 | `serve`, `user add / list / remove` | Web UI and its users |
 
@@ -489,6 +490,8 @@ output/<run-id>/
 - **Some inputs are rejected.** JavaScript-rendered pages saved from a browser contain no article text and are rejected with instructions; scanned PDFs need OCR first.
 - **Splunk raw and Loki assume Sysmon** for Windows process telemetry. Adjust `targets.py` for 4688-only environments.
 - **CrowdStrike CQL has no free test tenant.** Mark it `desk-checked` after review.
+- **Regexes are rewritten for whole-value engines.** Sigma `|re` matches anywhere; Lucene/OpenSearch/Wazuh indexer, ES|QL, EQL and Loki match the whole value, so ti2dac wraps the pattern in `.*….*` and, for Lucene and ES|QL (no `(?i)`), spells case-insensitivity as `[aA]` classes. Lookarounds, back-references and lazy quantifiers have no Lucene equivalent; such queries carry a note.
+- **Some pySigma backends are patched in `targets.py`.** Loki (OR groups from `|windash` and other expansions lost their parentheses: 59 SigmaHQ Windows rules converted to wrong logic), EQL (regex backslash escaping) and the QRadar pipeline (crashed on `|cidr`; now `INCIDR()`). Remove a patch when the upstream package fixes it.
 - **Duplicate detection is a similarity heuristic.** It surfaces candidates and leaves the decision to the reviewer.
 - **Live validation so far:** rule generation has been run end to end with Gemini Flash on one public DFIR case. On a synthetic incident report, redaction, the TLP policy and evidence extraction were checked live, but AI generation was stopped by free-tier rate limits. Claude, the default provider, has not yet run live. Review the first runs on your own reports closely.
 

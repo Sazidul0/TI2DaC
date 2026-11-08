@@ -92,7 +92,9 @@ def merge_meanwhile(settings: Settings, record, path: Path, before: dict) -> Non
         used.add(p.slug)
     record.packages = kept + others + mine
     record.chains = disk.chains   # jobs only rebuild chains; definitions come from people
-    record.warnings = list(dict.fromkeys(disk.warnings + [w for w in record.warnings if w not in before["warnings"]]))
+    gone = set(before["warnings"]) - set(record.warnings)   # the job resolved them (e.g. a retried rule now exists)
+    record.warnings = list(dict.fromkeys([w for w in disk.warnings if w not in gone]
+                                         + [w for w in record.warnings if w not in before["warnings"]]))
     record.usage = type(record.usage).model_validate(
         _add_delta(disk.usage.model_dump(), record.usage.model_dump(), before["usage"]))
     record.usage.unpriced_models = sorted({*disk.usage.unpriced_models, *record.usage.unpriced_models})

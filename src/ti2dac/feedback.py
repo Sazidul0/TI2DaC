@@ -148,6 +148,26 @@ class Store:
             r = c.execute("SELECT path FROM runs WHERE run_id=?", (run_id,)).fetchone()
             return r["path"] if r else None
 
+    def delete_run(self, run_id: str, actor: str) -> dict:
+        """Remove a run's rows: the run, its rules, feedback, test results and the lessons learned from its
+        feedback (they may quote the report). The audit log keeps the deletion. Returns what was removed."""
+        with self._conn() as c:
+            fids = [r["id"] for r in c.execute("SELECT id FROM feedback WHERE run_id=?", (run_id,))]
+            removed = {"lessons": c.execute(f"DELETE FROM lessons WHERE feedback_id IN ({','.join('?' * len(fids))})",
+                                            fids).rowcount if fids else 0}
+            for table in ("feedback", "test_results", "packages", "runs"):
+                removed[table] = c.execute(f"DELETE FROM {table} WHERE run_id=?", (run_id,)).rowcount
+        self.audit(actor, "run.delete", {"run_id": run_id, **removed}, logging.WARNING)
+        return removed
+
+    def running_jobs_for(self, run_id: str) -> list[str]:
+        """Running jobs that work on this run (generate jobs are labelled with the run id, AI feedback jobs
+        with the feedback id)."""
+        with self._conn() as c:
+            fids = {f"apply feedback #{r['id']}" for r in c.execute("SELECT id FROM feedback WHERE run_id=?", (run_id,))}
+            return [r["id"] for r in c.execute("SELECT id, label FROM jobs WHERE status='running'")
+                    if r["label"].startswith(f"{run_id}:") or r["label"] in fids]
+
     # ------------------------------------------------------------------ feedback
     def add_feedback(self, *, reviewer: str, run_id: str, slug: str, rule_id: str, rule_version: int,
                      artifact: str, category: str, severity: str, comment: str, correction: str = "",
@@ -215,18 +235,24 @@ class Store:
         `tlps` are returned (lessons without a marking predate it and are never sent)."""
         if not tlps:
             return []
-        parent = technique_id.split(".")[0]
+        from . import attack
+
+        # A lesson recorded under a since-revoked id (T1562.001) applies to its successor (T1685).
+        ids = [technique_id, *attack.predecessors(technique_id)]
+        parents = list(dict.fromkeys(x.split(".")[0] + "%" for x in ids))
         cats = [x for x in ([category] if isinstance(category, str) else category) if x] or ["\x00"]
         ph = ",".join("?" * len(cats))
         tph = ",".join("?" * len(tlps))
+        iph = ",".join("?" * len(ids))
+        like = " OR ".join("technique_id LIKE ?" for _ in parents)
         with self._conn() as c:
             rows = c.execute(
-                "SELECT text, CASE WHEN technique_id=? THEN 3 WHEN technique_id LIKE ? THEN 2 "
+                f"SELECT text, CASE WHEN technique_id IN ({iph}) THEN 3 WHEN ({like}) THEN 2 "
                 f"WHEN product=? AND category IN ({ph}) THEN 1 ELSE 0 END AS score FROM lessons "
                 f"WHERE active=1 AND tlp IN ({tph}) "
-                f"AND (technique_id=? OR technique_id LIKE ? OR (product=? AND category IN ({ph}))) "
+                f"AND (technique_id IN ({iph}) OR ({like}) OR (product=? AND category IN ({ph}))) "
                 "ORDER BY score DESC, id DESC LIMIT ?",
-                (technique_id, parent + "%", product, *cats, *tlps, technique_id, parent + "%", product, *cats, limit),
+                (*ids, *parents, product, *cats, *tlps, *ids, *parents, product, *cats, limit),
             ).fetchall()
         return list(dict.fromkeys(r["text"] for r in rows))
 

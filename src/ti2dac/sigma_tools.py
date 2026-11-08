@@ -91,6 +91,35 @@ def _value(v: str, mods: list[str]):
     return v
 
 
+_INLINE_FLAGS = re.compile(r"\(\?([ims]+)\)")
+
+
+def hoist_regex_flags(detection: dict) -> dict:
+    """`Field|re: '(?i)x'` -> `Field|re|i: 'x'`. Sigma states regex flags as modifiers; an inline group only
+    works in some backends (Lucene/Elastic regexes have none, and our Wazuh XML checks put it mid-pattern).
+    Only hoisted when every value of the field carries the same leading flags."""
+    def fix(m: dict) -> dict:
+        out = {}
+        for key, val in m.items():
+            mods = str(key).split("|")[1:]
+            vals = val if isinstance(val, list) else [val]
+            heads = {_INLINE_FLAGS.match(v).group(0) if isinstance(v, str) and _INLINE_FLAGS.match(v) else None
+                     for v in vals}
+            if "re" not in mods or len(heads) != 1 or None in heads:
+                out[key] = val
+                continue
+            head = heads.pop()
+            flags = [f for f in "ims" if f in head and f not in mods]
+            rest = [v[len(head):] for v in vals]
+            out["|".join([str(key).split("|")[0], *sorted(set(mods) | set(flags), key=_MOD_ORDER.index)])] = \
+                rest if isinstance(val, list) else rest[0]
+        return out
+
+    return {name: (sel if name == "condition" else fix(sel) if isinstance(sel, dict)
+                   else [fix(x) if isinstance(x, dict) else x for x in sel] if isinstance(sel, list) else sel)
+            for name, sel in detection.items()}
+
+
 def _expand_wildcards(condition: str, names: list[str]) -> str:
     """'1 of selection_*' / 'all of them' -> explicit boolean expressions over `names`."""
     from fnmatch import fnmatchcase
@@ -161,7 +190,7 @@ def build_detection(draft: SigmaDraft) -> tuple[dict, str]:
         condition = _expand_wildcards(condition, names)
         condition = re.sub(r"\b(" + "|".join(map(re.escape, splits)) + r")\b", lambda m: splits[m[1]], condition)
     detection["condition"] = condition
-    return detection, condition
+    return hoist_regex_flags(detection), condition
 
 
 def render_rule(draft: SigmaDraft, *, rule_id: str, author: str, references: list[str], tags: list[str],
@@ -247,7 +276,27 @@ def validate_rule(rule_yaml: str) -> tuple[bool, list[str]]:
             continue
         issues.append(f"{issue.severity.name.lower()}: {issue.__class__.__name__}: {issue.description}"
                       + (f" ({_issue_detail(issue)})" if _issue_detail(issue) else ""))
+    issues += _revoked_attack_tags(col)
     return True, issues
+
+
+def _revoked_attack_tags(col) -> list[str]:
+    """pySigma's bundled ATT&CK data predates v20, so it accepts ids that the local index knows are revoked (an
+    analyst-edited rule tagged attack.t1562.001)."""
+    from . import attack
+
+    out = []
+    for r in col.rules:
+        for tag in getattr(r, "tags", None) or []:
+            if str(tag.namespace) != "attack" or not re.fullmatch(r"t\d{4}(\.\d{3})?", str(tag.name), re.I):
+                continue
+            tid = str(tag.name).upper()
+            new, _ = attack.resolve_revoked(tid)
+            t = attack.lookup(tid)
+            if t and t.get("revoked"):
+                out.append(f"warning: RevokedATTACKTag: attack.{tag.name} is revoked in ATT&CK"
+                           + (f"; use attack.{new.lower()}" if new != tid else ""))
+    return out
 
 
 def _known_new_attack_tag(issue) -> bool:
@@ -323,13 +372,105 @@ def convert(rule_yaml: str, target_ids: list[str], index_overrides: dict[str, st
                                       if issubclass(w.category, UserWarning) and "ZZPROBEZZ" not in str(w.message)))
             if msgs:
                 res.notes = f"{res.notes} Backend warning (query may not match the rule exactly): {'; '.join(msgs)[:300]}".strip()
+            _regex_notes(res, rule_yaml)
         except Exception as e:
             res.error = _short_error(e)
-            res.validation = "failed"
-            if corr is not None:
+            if isinstance(e, AttributeError) and "'NoneType' object has no attribute 'format'" in str(e):
+                # e.g. ES|QL has no template for keyword (field-less) values and crashes instead of saying so
+                res.error = f"SigmaFeatureNotSupportedByBackendError: {t.label} has no form for this rule's " \
+                            "keyword (field-less) or other value type: not supported"
+            # A field this SIEM's data lacks is a coverage gap, not a broken query
+            res.validation = "failed" if conversion_problem(res.error) == "failed" else "not-tested"
+            narrowed = _without_unavailable(docs, res.error) if res.validation == "not-tested" else None
+            if narrowed is not None:
+                (alt,) = convert(narrowed[0], [tid], index_overrides, client)   # recurses once per missing field
+                if alt.query:
+                    alt.notes = f"{alt.notes} {narrowed[1]}".strip()
+                    res = alt
+            if res.error and corr is not None:
                 _threshold_fallback(res, docs, corr, client, (index_overrides or {}).get(tid, ""))
         results.append(res)
     return results
+
+
+_MISSING_FIELD = re.compile(r"field name encountered: (\w+(?:\.\w+)*)|field '([\w.]+)' is not supported"
+                            r"|does not support the (\w+) field", re.I)
+
+
+def _without_unavailable(docs: list[dict], error: str) -> tuple[str, str] | None:
+    """The rule without the OR alternatives that use fields this SIEM does not have, e.g. `Image|endswith` OR
+    `OriginalFileName` on SecurityEvent (4688 has no OriginalFileName). None when such a field is required
+    (AND-ed) somewhere, since dropping it would change what the rule means."""
+    import copy
+
+    missing = {next(x for x in groups if x) for groups in _MISSING_FIELD.findall(error)}
+    if not missing or not docs or not isinstance(docs[0].get("detection"), dict):
+        return None
+    doc = copy.deepcopy(docs[0])
+    det = doc["detection"]
+
+    def uses(m) -> bool:
+        return isinstance(m, dict) and any(str(k).split("|")[0] in missing for k in m)
+
+    dropped = []
+    for name, sel in det.items():
+        if name == "condition":
+            continue
+        if isinstance(sel, list) and any(uses(m) for m in sel):
+            keep = [m for m in sel if not uses(m)]
+            if not keep:
+                return None
+            det[name] = keep[0] if len(keep) == 1 else keep
+            dropped.append(name)
+        elif uses(sel):
+            return None
+    if not dropped:
+        return None
+    filters = [n for n in dropped if str(n).startswith("filter")]
+    note = (f"Converted without the {', '.join(sorted(missing))} alternative in {', '.join(dropped)}: this SIEM's "
+            "data does not record that field, so only the other alternatives can match.")
+    if filters:
+        note += f" The exclusion {', '.join(filters)} is narrower here, so expect more false positives."
+    return dump_docs([doc, *docs[1:]]), note
+
+
+def rule_regexes(rule_yaml: str) -> list[str]:
+    """Every `|re` value in the rule's detection."""
+    out: list[str] = []
+
+    def visit(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if "re" in str(k).split("|")[1:]:
+                    out.extend(str(x) for x in (v if isinstance(v, list) else [v]))
+        elif isinstance(node, list):
+            for n in node:
+                visit(n)
+
+    try:
+        for doc in load_docs(rule_yaml):
+            for k, v in (doc.get("detection") or {}).items():
+                if k != "condition":
+                    visit(v)
+    except Exception:
+        pass
+    return out
+
+
+def _regex_notes(res: QueryResult, rule_yaml: str) -> None:
+    """Whole-value regex engines get a rewritten pattern (targets.REGEX_FLAVOR); say what Lucene cannot express."""
+    from . import regexes
+    from .targets import REGEX_FLAVOR
+
+    flavor = REGEX_FLAVOR.get(res.target)
+    if not flavor:
+        return
+    if flavor in ("lucene", "eql"):
+        problems = sorted({p for r in rule_regexes(rule_yaml) for p in regexes.lucene_problems(r)})
+        if problems:
+            res.notes = (f"{res.notes} The rule's regex uses {', '.join(problems)}, which Lucene regular expressions "
+                         "do not support: the query will not parse or match as intended; rewrite it for this "
+                         "target.").strip()
 
 
 def _threshold_fallback(res: QueryResult, docs: list[dict], corr: dict, client, index_override: str) -> None:
@@ -357,6 +498,21 @@ def _short_error(e: Exception) -> str:
     msg = re.sub(r"(?<=\.)\s[^.]*:$", "", msg)                      # drop a dangling "... in this order:" lead-in
     msg = re.sub(r"\s*\(while (converting|applying)[^)]*\)", "", msg)
     return f"{type(e).__name__}: {msg}"[:300]
+
+
+_UNAVAILABLE = ("does not support logsource", "invalid sigmadetectionitem field name", "is not supported",
+                "not supported", "has no field mapping", "not yet supported", "does not support the",
+                "unable to determine table name",      # Kusto: no Sentinel/Defender table for this log source
+                "only file name of",                   # CrowdStrike: no full image path in its events
+                "have no wazuh rule equivalent", "expands to more than",
+                "no valid hash algo")                  # Defender: Hashes with only IMPHASH etc.
+
+
+def conversion_problem(error: str) -> str:
+    """'not-available': the SIEM's data or backend has no equivalent (expected for some log sources);
+    'failed': ti2dac or the backend broke on a rule it should convert."""
+    e = (error or "").lower()
+    return "not-available" if any(x in e for x in _UNAVAILABLE) else "failed"
 
 
 def _walk(det):
@@ -415,7 +571,11 @@ def map_field(base_doc: dict, field: str, tid: str, client=None) -> str:
                  if any("ZZPROBEZZ" in str(v) for v in it.value)]
         return ", ".join(dict.fromkeys(n for n in names if n)) or field
     except Exception as e:
-        return "UNSUPPORTED: " + _short_error(e).split(": ", 1)[-1][:140]
+        reason = _short_error(e).split(": ", 1)[-1]
+        if det != {"ti2dac_probe": {field: "ZZPROBEZZ"}} and field.split("|")[0].lower() not in reason.lower():
+            # Another field of the rule broke the probe; this one alone may map fine.
+            return map_field({"logsource": logsource, "detection": {}}, field, tid, client)
+        return "UNSUPPORTED: " + reason[:140]
 
 
 def field_mappings(rule_yaml: str, target_ids: list[str], client=None) -> list[FieldMapping]:

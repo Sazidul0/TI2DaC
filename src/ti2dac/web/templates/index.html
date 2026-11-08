@@ -6,6 +6,7 @@
 {% block content %}
 {%- set n_rules = runs|sum(attribute="rules") -%}
 {%- set n_approved = runs|sum(attribute="approved") -%}
+{% if deleted %}<div class="alert ok" style="margin-bottom:16px">{{ ui.icon("check-circle") }}<div><div class="alert-title">Run deleted</div><div class="xs" style="word-break:break-word">{{ deleted }}</div></div></div>{% endif %}
 <div class="page-head">
   <div class="titles">
     <h1>Detection runs</h1>
@@ -179,7 +180,9 @@
         <td class="num">{% if r.usage.estimated_cost_usd %}${{ "%.4f"|format(r.usage.estimated_cost_usd) }}{% else %}<span class="muted">-</span>{% endif %}</td>
         <td class="shrink"><div class="row" style="flex-wrap:nowrap;gap:4px">
           <a class="btn ghost icon sm" href="/runs/{{ r.run_id }}/download" title="Download package (zip)" aria-label="Download {{ r.title }} as zip">{{ ui.icon("download") }}</a>
-          <a class="btn outline sm" href="/runs/{{ r.run_id }}">Open{{ ui.icon("arrow-right", "sm") }}</a></div></td>
+          <a class="btn outline sm" href="/runs/{{ r.run_id }}">Open{{ ui.icon("arrow-right", "sm") }}</a>
+          {% if role == "admin" or user == r.created_by %}<form method="post" action="/runs/{{ r.run_id }}/delete" data-confirm="Delete this run? Its rules, queries, simulations, the uploaded report, feedback, test results and the lessons learned from it are removed for good. The audit log keeps a record of the deletion.">
+            <button class="btn ghost icon sm" type="submit" title="Delete run" aria-label="Delete {{ r.title }}" style="color:var(--destructive)">{{ ui.icon("trash") }}</button></form>{% endif %}</div></td>
       </tr>{% endfor %}
       <tr data-filter-empty hidden><td colspan="7">{{ ui.empty("No matching runs", "Try a different word, or clear the filter.", "search") }}</td></tr>
       </tbody>

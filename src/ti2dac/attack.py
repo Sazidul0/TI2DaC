@@ -21,12 +21,17 @@ def set_override_dir(state_dir: str | Path) -> None:
     global _OVERRIDE
     _OVERRIDE = Path(state_dir) / "attack_index.json"
     load_index.cache_clear()
+    _successor_map.cache_clear()
 
 
 def build_index(stix: dict) -> dict:
     techniques: dict[str, dict] = {}
     version = ""
+    stix_ids: dict[str, str] = {}      # STIX id -> ATT&CK id, for revoked-by relationships
+    revoked_by: dict[str, str] = {}    # STIX id -> STIX id
     for obj in stix.get("objects", []):
+        if obj.get("type") == "relationship" and obj.get("relationship_type") == "revoked-by":
+            revoked_by[obj.get("source_ref", "")] = obj.get("target_ref", "")
         if obj.get("type") == "x-mitre-collection":
             version = obj.get("x_mitre_version", version)
         if obj.get("type") != "attack-pattern":
@@ -34,6 +39,7 @@ def build_index(stix: dict) -> dict:
         ext = next((r for r in obj.get("external_references", []) if r.get("source_name") == "mitre-attack"), None)
         if not ext:
             continue
+        stix_ids[obj.get("id", "")] = ext["external_id"]
         techniques[ext["external_id"]] = {
             "name": obj.get("name", ""),
             "tactics": [p["phase_name"] for p in obj.get("kill_chain_phases", []) if p.get("kill_chain_name") == "mitre-attack"],
@@ -41,6 +47,9 @@ def build_index(stix: dict) -> dict:
             "deprecated": bool(obj.get("x_mitre_deprecated")),
             "revoked": bool(obj.get("revoked")),
         }
+    for src, dst in revoked_by.items():
+        if src in stix_ids and dst in stix_ids:
+            techniques[stix_ids[src]]["revoked_by"] = stix_ids[dst]
     return {"attack_version": version, "techniques": techniques}
 
 
@@ -55,6 +64,7 @@ def update_index(dest_dir: str | Path, source: str | None = None) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(build_index(stix), separators=(",", ":"), sort_keys=True))
     load_index.cache_clear()
+    _successor_map.cache_clear()
     return dest
 
 
@@ -68,6 +78,41 @@ def load_index() -> dict:
 
 def lookup(tid: str) -> dict | None:
     return load_index()["techniques"].get(tid.upper())
+
+
+def resolve_revoked(tid: str) -> tuple[str, str]:
+    """(current id, note) for a revoked technique: its revoked-by successor, or else the one live technique with the
+    same name (ATT&CK v20 moved e.g. T1562.001 "Disable or Modify Tools" to T1685 under defense-impairment).
+    Unchanged id and '' when the technique is live, unknown, or has no clear successor."""
+    idx = load_index()["techniques"]
+    t = idx.get(tid.upper())
+    if not t or not t.get("revoked"):
+        return tid, ""
+    new = t.get("revoked_by")
+    if not (new and new in idx and not idx[new]["revoked"] and not idx[new]["deprecated"]):
+        same = [k for k, v in idx.items() if k != tid.upper() and not v["revoked"] and not v["deprecated"]
+                and v["name"].lower() == t["name"].lower()]
+        new = same[0] if len(same) == 1 else None
+    if not new:
+        return tid, ""
+    return new, f"{tid} is revoked in ATT&CK; replaced by {new} ({idx[new]['name']})"
+
+
+def predecessors(tid: str) -> list[str]:
+    """Revoked techniques whose successor is `tid` (T1685 -> ['T1562.001']): lessons and history recorded under
+    the old id still apply to the new one."""
+    return _successor_map().get(tid.upper(), [])
+
+
+@lru_cache(maxsize=1)
+def _successor_map() -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for k, v in load_index()["techniques"].items():
+        if v.get("revoked"):
+            new, _ = resolve_revoked(k)
+            if new != k:
+                out.setdefault(new, []).append(k)
+    return out
 
 
 def validate_mapping(tid: str, name: str, tactic: str) -> tuple[bool, str, str, str]:

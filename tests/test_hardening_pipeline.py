@@ -320,3 +320,152 @@ def test_malformed_repo_rules_are_skipped(settings, tmp_path):
     settings.rule_repos = [str(repo)]
     rule = st.render_rule(task_draft().sigma, rule_id=str(uuid.uuid4()), author="t", references=[], tags=[])
     assert any("other" in s for s in duplicates.find_similar(rule, settings))
+
+
+# --------------------------------------------------------------------------- live Salat run, 2026-11-05
+_RUN_KEY = r"""title: Run key to random AppData exe
+id: d9586855-30fb-56ad-890f-b744f3cc3e0f
+status: experimental
+logsource: {product: windows, category: registry_set}
+detection:
+  selection_key:
+    TargetObject|contains: '\Microsoft\Windows\CurrentVersion\Run'
+  selection_value:
+    Details|re: '(?i)\\AppData\\Roaming\\[a-z0-9]{14}\\[a-z0-9]{5}\.exe'
+  condition: selection_key and selection_value
+level: high
+"""
+
+
+def test_inline_regex_flags_become_modifiers_and_every_target_handles_them():
+    d = task_draft()
+    d.sigma.selections.append(Selection(name="selection_re", clauses=[Clause(conditions=[
+        FieldCondition(field="CommandLine", modifiers=["re"], values=[r"(?i)/sc\s+onlogon"])])]))
+    det, _ = st.build_detection(d.sigma)
+    assert det["selection_re"] == {"CommandLine|re|i": r"/sc\s+onlogon"}
+
+    # a rule that still carries the inline group (e.g. an older run): Wazuh used to fail, EQL/Lucene degraded
+    by = {q.target: q for q in st.convert(_RUN_KEY, ["wazuh_rule", "elastic_eql", "elastic_lucene", "splunk"])}
+    assert by["wazuh_rule"].error is None and "(?i:" in by["wazuh_rule"].query
+    assert "(?i)" not in by["elastic_eql"].query and "regex~" in by["elastic_eql"].query
+    lucene = by["elastic_lucene"].query   # Lucene has no (?i): the letters are case-folded instead
+    assert "(?i)" not in lucene and "[aA][pP][pP][dD][aA][tT][aA]" in lucene and "[a-z0-9A-Z]{14}" in lucene
+    assert "(?i)" in by["splunk"].query and "(?i)" not in by["splunk"].notes
+
+
+def test_human_correction_with_inline_flag_is_stored_with_the_modifier(settings, report_file, monkeypatch):
+    record, _, _ = _run(settings, report_file, monkeypatch)
+    pkg = record.packages[0]
+    doc = yaml.safe_load(pkg.rule_yaml)
+    doc["detection"]["selection_extra"] = {"CommandLine|re": "(?i)onlogon"}
+    doc["detection"]["condition"] += " and selection_extra"
+    new = pipeline.apply_correction(record, pkg.slug, settings, corrected_yaml=yaml.safe_dump(doc, sort_keys=False))
+    assert yaml.safe_load(new.rule_yaml)["detection"]["selection_extra"] == {"CommandLine|re|i": "onlogon"}
+
+
+def test_missing_fields_are_not_available_rather_than_failed():
+    assert st.conversion_problem("SigmaTransformationError: Invalid SigmaDetectionItem field name encountered: "
+                                 "OriginalFileName.") == "not-available"
+    assert st.conversion_problem("SigmaTransformationError: field 'Details' is not supported") == "not-available"
+    assert st.conversion_problem("crowdstrike_cql pipeline has no field mapping for this log source") == "not-available"
+    assert st.conversion_problem("error: global flags not at the start of the expression at position 3") == "failed"
+
+
+def test_retried_rule_clears_its_old_failure_and_stale_chain_warnings(settings, report_file, monkeypatch):
+    record, _, fake = _run(settings, report_file, monkeypatch)
+    have = {p.behaviour.id for p in record.packages}
+    b = next(x for x in record.behaviours if x.id not in have)
+    old = f"{b.id} ({b.technique_id}) not generated: generate: bad request: grammar too large"
+    stale = f"Sequence 'Old' ({b.id} -> B1) needs rules for {b.id} first: ti2dac generate x --select {b.id}"
+    record.warnings += [old, stale]
+    pipeline.generate(record, settings, fake, behaviour_ids=[b.id])
+    assert b.id in {p.behaviour.id for p in record.packages}
+    assert old not in record.warnings and stale not in record.warnings
+
+
+def test_pe_metadata_file_names_are_not_brittle_artifacts():
+    from ti2dac import quality
+
+    rule = ("detection:\n  sel:\n    OriginalFileName: ApplicationFrameHost.exe\n  sel2:\n    Image|endswith: '\\loader.exe'\n"
+            "  condition: sel and sel2\n")
+    assert quality.brittle_artifacts(rule, ["ApplicationFrameHost.exe", "loader.exe"]) == ["loader.exe"]
+    assert quality.brittle_artifacts(rule.replace("OriginalFileName", "Image"), ["applicationframehost.exe"]) == []
+
+
+def test_selftest_flags_filters_no_benign_event_exercises():
+    from ti2dac.models import EventField, TestEvent
+
+    rule = ("title: t\nlogsource: {product: windows, category: process_creation}\ndetection:\n"
+            "  sel: {Image|endswith: '\\reagentc.exe'}\n  filter_sccm: {ParentImage|endswith: '\\ccmexec.exe'}\n"
+            "  condition: sel and not filter_sccm\n")
+
+    def ev(match, **f):
+        return TestEvent(description="e", should_match=match, fields=[EventField(name=k, value=v) for k, v in f.items()])
+
+    pos = ev(True, Image="C:\\Windows\\System32\\reagentc.exe", ParentImage="C:\\Windows\\explorer.exe")
+    other = ev(False, Image="C:\\Windows\\System32\\cmd.exe", ParentImage="C:\\Windows\\explorer.exe")
+    sccm = ev(False, Image="C:\\Windows\\System32\\reagentc.exe", ParentImage="C:\\Windows\\CCM\\ccmexec.exe")
+    assert replay.untested_filters(rule, [pos, other]) == ["filter_sccm"]
+    assert replay.untested_filters(rule, [pos, other, sccm]) == []
+
+
+def test_atomic_test_and_lint_guard_the_recovery_simulation(settings, report_file, monkeypatch):
+    from ti2dac import safety
+
+    record, out, _ = _run(settings, report_file, monkeypatch)
+    atomic = next(out.glob("simulations/*/atomic-test.yaml")).read_text()
+    test = yaml.safe_load(atomic)["atomic_tests"][0]["executor"]
+    assert "TI2DAC_LAB" in test["command"] and "TI2DAC_LAB" in test["cleanup_command"]
+    found = {(f.rule, f.severity) for f in safety.lint_script("reagentc /disable", cleanup="Remove-Item $env:TEMP\\x")}
+    assert ("recovery-tamper", "warn") in found and ("missing-cleanup", "warn") in found
+    regs = safety.lint_script("Set-ItemProperty -Path HKCU:\\Software\\x -Name a -Value b", cleanup="Remove-Item $env:TEMP\\a")
+    assert any(f.rule == "missing-cleanup" for f in regs)
+    assert not any(f.rule == "missing-cleanup" for f in safety.lint_script(
+        "Set-ItemProperty -Path HKCU:\\Software\\x -Name a -Value b", cleanup="Remove-ItemProperty -Path HKCU:\\Software\\x -Name a"))
+
+
+def test_every_configured_target_converts_a_plain_process_rule():
+    # A pipeline copy once broke splunk_cim ("cannot pickle 'dict_keys'") and nothing noticed
+    from ti2dac.config import Settings
+
+    rule = ("title: t\nid: 47dfd07a-7bd4-5661-ab4f-1f37e10cd6af\nstatus: experimental\n"
+            "logsource: {product: windows, category: process_creation}\n"
+            "detection:\n  sel: {Image|endswith: '\\reagentc.exe', CommandLine|contains: ' /disable'}\n  condition: sel\n")
+    failed = {q.target: q.error for q in st.convert(rule, Settings().targets) if q.error}
+    assert failed == {}, failed
+
+
+def test_one_rules_missing_field_never_appears_in_the_next_rules_error():
+    rule = ("title: t\nid: 47dfd07a-7bd4-5661-ab4f-1f37e10cd6af\nstatus: experimental\n"
+            "logsource: {product: windows, category: %s}\ndetection:\n  sel: {%s: x}\n  condition: sel\n")
+    errors = [st.convert(rule % (cat, f), ["sentinel_securityevent"])[0].error
+              for cat, f in [("process_creation", "OriginalFileName"), ("process_creation", "OriginalFileName"),
+                             ("process_creation", "Company")]]
+    assert errors[0] == errors[1] and "OriginalFileName" not in errors[2] and "Company" in errors[2]
+
+
+# --------------------------------------------------------------------------- Sentinel SecurityEvent coverage
+_PROC = ("title: t\nid: 723ff70c-6703-5ee5-8219-64aabe455c79\nstatus: experimental\n"
+         "logsource: {product: windows, category: process_creation}\ndetection:\n%s  condition: %s\n")
+
+
+def test_securityevent_drops_an_or_alternative_it_cannot_express_and_says_so():
+    rule = _PROC % ("  sel_img:\n  - Image|endswith: '\\reagentc.exe'\n  - OriginalFileName: reagentc.exe\n"
+                    "  sel_cli: {CommandLine|contains: ' /disable'}\n", "sel_img and sel_cli")
+    q = st.convert(rule, ["sentinel_securityevent"])[0]
+    assert q.error is None and 'NewProcessName endswith "\\\\reagentc.exe"' in q.query
+    assert "OriginalFileName" not in q.query and "without the OriginalFileName alternative in sel_img" in q.notes
+    # a field the rule requires (AND-ed) is never dropped: that would change what the rule means
+    required = _PROC % ("  sel: {OriginalFileName: reagentc.exe, CommandLine|contains: ' /disable'}\n", "sel")
+    q = st.convert(required, ["sentinel_securityevent"])[0]
+    assert q.query is None and st.conversion_problem(q.error) == "not-available"
+
+
+def test_securityevent_registry_rule_uses_the_4657_columns():
+    rule = ("title: t\nid: d9586855-30fb-56ad-890f-b744f3cc3e0f\nstatus: experimental\n"
+            "logsource: {product: windows, category: registry_set}\ndetection:\n"
+            "  sel: {TargetObject|contains: '\\CurrentVersion\\Run', Details|endswith: '.exe'}\n"
+            "  filter: {Image|endswith: '\\msiexec.exe'}\n  condition: sel and not filter\n")
+    q = st.convert(rule, ["sentinel_securityevent"])[0].query
+    assert "EventID == 4657" in q and 'NewValue endswith ".exe"' in q
+    assert 'ProcessName endswith "\\\\msiexec.exe"' in q and "NewProcessName" not in q   # 4688's column

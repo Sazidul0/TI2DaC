@@ -322,3 +322,62 @@ def test_correction_is_refused_while_ai_is_paused(settings, report_file, monkeyp
     assert r.status_code == 303 and r.headers["location"] == "/ai?blocked=1"
     assert Store(settings.db_path).list_feedback(record.run_id) == []
     assert load_record(out).packages[0].version == pkg.version
+
+
+def test_warning_a_job_resolved_does_not_come_back_from_disk(settings, report_file, monkeypatch):
+    record, out = _run(settings, report_file, monkeypatch, actor="alice")
+    record.warnings.append("B9 (T1105) not generated: generate: bad request")
+    from ti2dac.render import save_record
+
+    save_record(record, out)
+
+    def fake_generate(rec, *a, **k):
+        rec.warnings.remove("B9 (T1105) not generated: generate: bad request")
+        rec.warnings.append("new note")
+        return []
+
+    monkeypatch.setattr(pipeline, "generate", fake_generate)
+    monkeypatch.setattr(pipeline, "check_tlp_for_run", lambda *a: None)
+    monkeypatch.setattr("ti2dac.web.jobs.LLM", lambda *a, **k: None)
+    client = _client(settings)
+    r = client.post(f"/runs/{record.run_id}/generate", data={"select": "B9"}, follow_redirects=False)
+    assert _wait_job(client, r.headers["location"].rsplit("/", 1)[1])["status"] == "done"
+    warnings = load_record(out).warnings
+    assert "new note" in warnings and not any(w.startswith("B9 (T1105) not generated") for w in warnings)
+
+
+# --------------------------------------------------------------------------- deleting a run
+def test_deleting_a_run_removes_its_folder_rows_and_lessons(settings, report_file, monkeypatch):
+    record, out = _run(settings, report_file, monkeypatch, actor="alice")
+    keep, _ = _run(settings, report_file, monkeypatch, actor="alice")   # a second run of the same report stays
+    store = Store(settings.db_path)
+    slug = record.packages[0].slug
+    fid = store.add_feedback(reviewer="alice", run_id=record.run_id, slug=slug, rule_id="x", rule_version=1,
+                             artifact="sigma_rule", category="too_broad_fp", severity="low", comment="quotes the report")
+    store.add_lesson(store.get_feedback(fid), "T1053.005", "windows", "process_creation", tlp="clear")
+    store.add_test_result(tester="alice", run_id=record.run_id, slug=slug, rule_version=1, target="splunk", result="fired")
+    users = Users(settings.state_dir)
+    users.add("carol", "analyst password 123", "analyst")
+    users.add("alice", "creator password 123", "analyst")
+    users.add("root", "admin password 12345", "admin")
+    client = _client(settings)
+    url = f"/runs/{record.run_id}/delete"
+
+    assert client.post(url, auth=("carol", "analyst password 123")).status_code == 403   # not hers
+    with store._conn() as c:   # a job still working on the run
+        c.execute("INSERT INTO jobs(id, created_at, actor, label, status) VALUES ('j1', '', 'alice', ?, 'running')",
+                  (f"{record.run_id}: generate ['B4']",))
+    assert client.post(url, auth=("root", "admin password 12345")).status_code == 409
+    with store._conn() as c:
+        c.execute("UPDATE jobs SET status='done' WHERE id='j1'")
+    assert "Delete run" in client.get(f"/runs/{record.run_id}", auth=("alice", "creator password 123")).text
+
+    r = client.post(url, auth=("alice", "creator password 123"), follow_redirects=False)   # the creator may
+    assert r.status_code == 303 and "deleted=" in r.headers["location"]
+    assert not out.exists() and store.run_path(record.run_id) is None
+    assert not store.list_feedback(record.run_id) and not store.test_results(record.run_id)
+    assert not store.list_lessons()
+    assert client.get(f"/runs/{record.run_id}", auth=("root", "admin password 12345")).status_code == 404
+    assert store.run_path(keep.run_id) and (Path(settings.output_dir) / keep.run_id).is_dir()
+    assert any(e["action"] == "run.delete" for e in store.audit_entries())
+    assert "Run deleted" in client.get(r.headers["location"], auth=("root", "admin password 12345")).text

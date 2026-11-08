@@ -99,9 +99,14 @@ def _pattern(value, anchored: bool = True) -> str:
     if isinstance(value, SigmaNumber):
         return f"{a}{value.number}{z}"
     if isinstance(value, SigmaRegularExpression):
-        flags = "".join(sorted({str(getattr(f, "name", f)).lower()[:1] for f in getattr(value, "flags", set()) or set()}
-                               & {"i", "m", "s"}))
-        return f"(?{flags}:{value.regexp})" if flags else f"(?:{value.regexp})"
+        flags = {str(getattr(f, "name", f)).lower()[:1] for f in getattr(value, "flags", set()) or set()} & {"i", "m", "s"}
+        regexp = value.regexp
+        lead = re.match(r"\(\?([ims]+)\)", regexp)   # an inline (?i) would end up mid-pattern inside our group
+        if lead:
+            flags |= set(lead.group(1))
+            regexp = regexp[lead.end():]
+        flags_s = "".join(sorted(flags))
+        return f"(?{flags_s}:{regexp})" if flags_s else f"(?:{regexp})"
     if isinstance(value, SigmaString):
         out = []
         for part in value.s:

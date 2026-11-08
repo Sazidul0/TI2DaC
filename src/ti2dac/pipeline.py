@@ -156,7 +156,9 @@ def build_behaviours(analysis: ReportAnalysis, source_text: str) -> list[Behavio
         b.id = f"B{i}"
         b.technique_id = b.technique_id.strip().upper()
         b.evidence_verified = [verify_evidence(q, norm_source) for q in b.evidence]
+        b.technique_id, moved = attack.resolve_revoked(b.technique_id)
         ok, note, name, tactic = attack.validate_mapping(b.technique_id, b.technique_name, b.tactic)
+        note = "; ".join(x for x in (moved, note) if x)
         b.attack_valid, b.attack_note, b.technique_name, b.tactic = ok, note, name, tactic  # type: ignore[assignment]
         cal = quality.calibrate_scores(b.technique_id, b.scores)
         if cal:
@@ -303,6 +305,10 @@ def _check(pkg: DetectionPackage, settings: Settings, record: RunRecord | None =
     # Unit-test the rule against the events its own simulation should produce (and benign look-alikes).
     pkg.selftest, pkg.selftest_details = replay.selftest(pkg.rule_yaml, pkg.draft.test_events)
     selftest_issue = [f"self-test: {d}" for d in pkg.selftest_details] if pkg.selftest == "fail" else []
+    untested = replay.untested_filters(pkg.rule_yaml, pkg.draft.test_events) if pkg.selftest == "pass" else []
+    if untested:
+        pkg.quality_warnings.append(f"Self-test does not exercise {', '.join(untested)}: no benign test event is excluded "
+                                    "by it, so whether the exclusion works is untested. Add a look-alike it should drop.")
     ls = st.first_doc(pkg.rule_yaml).get("logsource") or {}
     # A rule naming both a category and a service (windows authentication + security) is covered by either.
     keys = [f"{ls.get('product', '')}:{ls[k]}" for k in ("category", "service") if ls.get(k)] or [f"{ls.get('product', '')}:"]
@@ -346,7 +352,7 @@ def _ai_fields(pkg: DetectionPackage, client, members: list[str], tid: str) -> d
             continue
         for t in members:
             v = fm.targets.get(t, "")
-            if v and not v.startswith("UNSUPPORTED"):
+            if v and not v.startswith("UNSUPPORTED") and not _passthrough(t, fm.sigma_field, v):
                 out[fm.sigma_field] = v
                 break
     if client is not None:
@@ -354,6 +360,27 @@ def _ai_fields(pkg: DetectionPackage, client, members: list[str], tid: str) -> d
         for t in [*members, tid]:
             out.update({f: n for f, n in client.fields_for(t).items() if f in used})
     return out
+
+
+def _passthrough(target: str, sigma_field: str, mapped: str) -> bool:
+    """A renaming pipeline left the Sigma name unchanged: it does not know the field. Handing it to the AI as the
+    target name made it copy Sysmon names (TargetObject, Details) into a CrowdStrike query that cannot match."""
+    return target in RENAMING_TARGETS and mapped == sigma_field and sigma_field not in NATIVE_FIELDS.get(target, set())
+
+
+def leftover_sigma_names(rule_yaml: str, query: str, fields: dict[str, str], members: list[str]) -> list[str]:
+    """Sigma field names an AI gap-fill translation still uses although the SIEM's data does not have them. Not
+    counted: names mapped for the AI, native names of the family's targets (SecurityEvent's EventID), and names the
+    query defines itself (`extend TaskContent = ...`, `eval x=`, `x := ...`, `(?<x>...)`, `... as x`)."""
+    native = set().union(*(NATIVE_FIELDS.get(t, set()) for t in members)) if members else set()
+    defined: set[str] = set()
+    for clause in re.split(r"\|", query):
+        if re.match(r"\s*(extend|eval|project|project-rename|let|parse|rename|summarize)\b", clause, re.I):
+            defined |= set(re.findall(r"\b(\w+)\s*=(?!=)", clause))
+    defined |= set(re.findall(r"\b(\w+)\s*:=", query)) | set(re.findall(r"\(\?P?<(\w+)>", query)) \
+        | set(re.findall(r"\bas\s+(\w+)", query, re.I))
+    return [f for f in st.rule_fields(rule_yaml) if f not in fields and f not in native and f not in defined
+            and re.search(rf"(?<![\w.]){re.escape(f)}(?![\w.])", query)]
 
 
 def _ai_references(pkg: DetectionPackage, cname: str) -> dict[str, str]:
@@ -439,6 +466,10 @@ def _translate_llm(pkg: DetectionPackage, settings: Settings, llm: LLM, redactio
                                    TranslationDraft)
                 res.query, res.notes = _unredact(t.query.strip(), red, sent), f"confidence={t.confidence}; {t.notes}"
                 problems = check_ai_query(res.query, fields, tid)
+                if members != [tid]:   # gap fill for a family: unmapped Sigma names do not exist in that SIEM
+                    left = leftover_sigma_names(pkg.rule_yaml, res.query, fields, members)
+                    if left:
+                        problems.append(f"uses Sigma field names this SIEM's data does not have: {', '.join(left)}")
                 if problems:
                     res.notes += " CHECK: " + "; ".join(problems)
             except LLMError as e:
@@ -546,6 +577,8 @@ def generate(record: RunRecord, settings: Settings, llm: LLM, store: Store | Non
     todo = [b for b in record.behaviours if (b.id in behaviour_ids if behaviour_ids else b.selected)]
     existing = {p.behaviour.id for p in record.packages}
     todo = [b for b in todo if b.id not in existing]
+    retried = tuple(f"{b.id} ({b.technique_id}) not generated: " for b in todo)
+    record.warnings = [w for w in record.warnings if not w.startswith(retried)]   # re-added if it fails again
     start = len(record.packages)
     analysis = record.analysis
     context = {"report": record.report.title, "actors": analysis.actors if analysis else [],
@@ -597,17 +630,74 @@ def generate(record: RunRecord, settings: Settings, llm: LLM, store: Store | Non
     return pkgs
 
 
+def recheck_run_metadata(record: RunRecord, run_dir: Path, settings: Settings) -> list[str]:
+    """No-AI refresh of what ti2dac derives deterministically outside the rules: IOCs (re-extracted from the
+    stored source copy), revoked ATT&CK ids, and the checks on kept AI translations. Returns what changed."""
+    changed = []
+    src = run_dir / "source" / Path(record.report.source).name
+    if src.is_file():
+        try:
+            fresh = extract_iocs(load_report(str(src), settings.fetch).text)
+        except Exception as e:   # noqa: BLE001 - a source that no longer parses keeps the old IOCs
+            changed.append(f"IOCs kept: source copy could not be re-read ({type(e).__name__})")
+        else:
+            if fresh != record.iocs:
+                record.iocs = fresh
+                changed.append("IOCs re-extracted")
+    with_rule = {p.behaviour.id for p in record.packages}
+    for b in record.behaviours:
+        new, moved = attack.resolve_revoked(b.technique_id)
+        if not moved:
+            continue
+        b.technique_id = new
+        ok, note, name, tactic = attack.validate_mapping(new, b.technique_name, b.tactic)
+        b.attack_valid, b.technique_name, b.tactic = ok, name, tactic  # type: ignore[assignment]
+        b.attack_note = "; ".join(x for x in (moved, note) if x)
+        record.warnings = [w for w in record.warnings if not (w.startswith(f"{b.id}: ") and "revoked" in w)]
+        record.warnings.append(f"{b.id}: {b.attack_note}" + (
+            f"; its rule still carries the old ATT&CK tag: regenerate it (ti2dac generate {record.run_id} "
+            f"--select {b.id})" if b.id in with_rule else ""))
+        changed.append(f"{b.id}: {moved}")
+    for pkg in record.packages:
+        for q in pkg.queries:
+            if q.method != "llm" or not q.query or not q.target.endswith("_ai"):
+                continue
+            members = FAMILIES.get(q.target[:-3], ([], "", ""))[0]
+            left = leftover_sigma_names(pkg.rule_yaml, q.query, _ai_fields(pkg, None, members, q.target), members)
+            stale = re.search(r" CHECK: uses Sigma field names this SIEM's data does not have: [^;]*", q.notes)
+            if stale and not left:   # an earlier, cruder check flagged names the query defines or the SIEM has
+                q.notes = q.notes.replace(stale.group(0), "")
+                changed.append(f"{pkg.slug} {q.target}: cleared a false Sigma-field-name flag")
+            if left and not stale:
+                q.notes += f" CHECK: uses Sigma field names this SIEM's data does not have: {', '.join(left)}"
+                changed.append(f"{pkg.slug} {q.target}: flagged Sigma field names")
+    return changed
+
+
 def rebuild_chains(record: RunRecord, settings: Settings, progress: Progress = _noop) -> None:
     """(Re)build every multi-event chain from the current rule versions: the sequences the analysis proposed
     (once all their steps have rules) plus chains an analyst defined. Deterministic, no AI calls."""
     by_beh = {p.behaviour.id: p for p in record.packages}
     by_slug = {p.slug: p for p in record.packages}
     specs = []
+    # Recomputed below from the current rules: last build's "needs rules for" / "not built" notes are stale,
+    # and so is a "not generated" note for a behaviour that has a rule by now.
+    record.warnings = [w for w in record.warnings
+                       if not re.match(r"Sequence '.*' (\(.*\) needs rules for |not built: )", w)
+                       and not ((m := re.match(r"(B\d+) \(.*?\) not generated: ", w)) and m.group(1) in by_beh)]
     for s in (record.analysis.sequences if record.analysis else []):
         missing = [b for b in s.behaviour_ids if b not in by_beh]
         if missing:
-            note = (f"Sequence '{s.name}' ({' -> '.join(s.behaviour_ids)}) needs rules for {', '.join(missing)} first: "
-                    f"ti2dac generate {record.run_id} --select {','.join(missing)}")
+            beh = {b.id: b for b in record.behaviours}
+            dark = [b for b in missing if b in beh and beh[b].scores.observability <= 2]
+            note = f"Sequence '{s.name}' ({' -> '.join(s.behaviour_ids)}) needs rules for {', '.join(missing)} first: "
+            if dark:
+                # e.g. in-memory reflective loading: suggesting a log rule for it sends the analyst nowhere
+                note += (f"{', '.join(dark)} scored {'/'.join(str(beh[b].scores.observability) for b in dark)}/5 for "
+                         "observability, so ordinary logs probably cannot show it; build this chain only if you have "
+                         f"telemetry for it (ti2dac generate {record.run_id} --select {','.join(missing)})")
+            else:
+                note += f"ti2dac generate {record.run_id} --select {','.join(missing)}"
             if note not in record.warnings:
                 record.warnings.append(note)
             continue
@@ -822,6 +912,8 @@ def apply_correction(record: RunRecord, slug: str, settings: Settings, *, correc
         if not docs or "detection" not in docs[0]:
             raise ValueError("correction is not a Sigma rule (first document needs a detection section)")
         data = docs[0]
+        if isinstance(data["detection"], dict):
+            data["detection"] = st.hoist_regex_flags(data["detection"])
         data["id"] = old.rule_id                     # identity is stable across versions
         data["modified"] = date.today().isoformat()
         new.rule_yaml = st.dump_docs(docs)

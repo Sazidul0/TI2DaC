@@ -278,3 +278,25 @@ def selftest(rule_yaml: str, test_events) -> tuple[str, list[str]]:
     if not any(t.should_match for t in test_events):
         problems.append("no positive test event supplied")
     return ("fail" if problems else "pass"), problems
+
+
+def untested_filters(rule_yaml: str, test_events) -> list[str]:
+    """`filter*` selections that no benign test event exercises: with the filter switched off, no look-alike
+    starts matching, so a passing self-test says nothing about whether that filter works."""
+    import copy
+
+    from .sigma_tools import dump_docs, first_doc
+
+    events = [{f.name: f.value for f in t.fields} for t in test_events if not t.should_match]
+    doc = first_doc(rule_yaml)
+    det = doc.get("detection") or {}
+    out = []
+    for name in [k for k in det if k != "condition" and str(k).startswith("filter")]:
+        variant = copy.deepcopy(doc)
+        variant["detection"][name] = {"TI2DAC_FILTER_OFF": "TI2DAC_FILTER_OFF"}   # never matches: `not filter` holds
+        try:
+            if not events or not evaluate(dump_docs([variant]), events):
+                out.append(name)
+        except ReplayError:
+            continue
+    return out

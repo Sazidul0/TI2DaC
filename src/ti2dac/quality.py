@@ -21,16 +21,25 @@ psexec.exe psexesvc.exe paexec.exe procdump.exe procdump64.exe sysmon.exe sysmon
 winrar.exe rar.exe rclone.exe anydesk.exe teamviewer.exe screenconnect.clientservice.exe atera.exe
 ngrok.exe plink.exe putty.exe winscp.exe mimikatz.exe rubeus.exe sharphound.exe adfind.exe bloodhound.exe
 nanodump.exe lazagne.exe advanced_ip_scanner.exe netscan.exe megasync.exe filezilla.exe
+applicationframehost.exe runtimebroker.exe sihost.exe werfault.exe searchprotocolhost.exe searchindexer.exe
+smss.exe csrss.exe wininit.exe lsm.exe spoolsv.exe ctfmon.exe fontdrvhost.exe dwm.exe audiodg.exe wermgr.exe
+backgroundtaskhost.exe smartscreen.exe securityhealthservice.exe msmpeng.exe reagentc.exe consent.exe
 comsvcs.dll ntdll.dll kernel32.dll dbghelp.dll dbgcore.dll samlib.dll vaultcli.dll wininet.dll
 """.split())
 
 _FILE = re.compile(r"[\w.-]{1,64}\.(?:exe|dll|ps1|bat|cmd|vbs|js|hta|msi|scr|sys|sh|py|elf|so|lnk|jar)\b", re.I)
 
 
+# PE version-info fields survive a rename (changing them means editing the binary's resources), so naming a
+# file there is the robust way to catch renamed tools and masquerading copies, not an IOC.
+_PE_FIELDS = {"originalfilename", "product", "description", "company", "internalname"}
+
+
 def _values(node, out: list[str]) -> None:
     if isinstance(node, dict):
-        for v in node.values():
-            _values(v, out)
+        for k, v in node.items():
+            if str(k).split("|")[0].lower() not in _PE_FIELDS:
+                _values(v, out)
     elif isinstance(node, list):
         for v in node:
             _values(v, out)

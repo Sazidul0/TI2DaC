@@ -66,6 +66,27 @@ _QUOTA_HINTS = ("per day", "perday", "free_tier", "quota", "credit balance", "sp
                 "billing", "exceeded your current")
 
 
+# (model, schema) pairs Anthropic refused to compile into an output grammar ("compiled grammar is too large").
+# The limit is not published; such schemas are asked for as plain JSON and validated here instead.
+_NO_GRAMMAR: set[tuple[str, str]] = set()
+
+
+def _grammar_too_large(message: str) -> bool:
+    m = (message or "").lower()
+    return "grammar" in m and ("too large" in m or "too complex" in m)
+
+
+def _json_instruction(schema: type[BaseModel]) -> str:
+    return ("\n\nReply with exactly one JSON object that conforms to this JSON Schema, and nothing else "
+            "(no prose, no code fences):\n" + json.dumps(schema.model_json_schema(), separators=(",", ":")))
+
+
+def _json_object(text: str) -> str:
+    """The JSON object in a reply that was not grammar-constrained (models sometimes add fences or a preamble)."""
+    start, end = text.find("{"), text.rfind("}")
+    return text[start:end + 1] if 0 <= start < end else text
+
+
 def _is_quota(message: str) -> bool:
     """Long-lived limit (daily quota, credit, spend cap) as opposed to a per-minute rate limit."""
     m = (message or "").lower()
@@ -409,16 +430,20 @@ class LLM:
 
     # ------------------------------------------------------------------ providers
     def _call_anthropic(self, stage: str, cfg: StageConfig, system: str, user: str, schema: type[BaseModel]) -> str:
+        constrained = (cfg.model, schema.__name__) not in _NO_GRAMMAR
         kwargs: dict = {
             "model": cfg.model,
             "max_tokens": cfg.max_tokens,
             # Frozen system prompt marked cacheable: repeated stage-2 calls in a run reuse it.
-            "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+            "system": [{"type": "text", "text": system if constrained else system + _json_instruction(schema),
+                        "cache_control": {"type": "ephemeral"}}],
             "messages": [{"role": "user", "content": user}],
-            "output_config": {"format": {"type": "json_schema", "schema": transform_schema(schema)}},
+            "output_config": {"format": {"type": "json_schema", "schema": transform_schema(schema)}} if constrained else {},
         }
         if cfg.effort:
             kwargs["output_config"]["effort"] = cfg.effort
+        if not kwargs["output_config"]:
+            del kwargs["output_config"]
         if self.settings.ai.server_side_fallback and cfg.model in FALLBACK_MODELS:
             kwargs["betas"] = [_FALLBACK_BETA]
             kwargs["fallbacks"] = "default"
@@ -444,6 +469,11 @@ class LLM:
         except anthropic.BadRequestError as e:
             if _is_quota(e.message):   # e.g. "credit balance is too low", workspace spend limit reached
                 raise self._block(stage, "anthropic", "quota_exhausted", e.message, None) from e
+            if constrained and _grammar_too_large(e.message):   # rejected before any output: nothing billed
+                _NO_GRAMMAR.add((cfg.model, schema.__name__))
+                obs.event("ai.unconstrained", logging.WARNING, stage=stage, model=cfg.model, schema=schema.__name__,
+                          reason=e.message[:200])
+                return self._call_anthropic(stage, cfg, system, user, schema)
             raise LLMError(f"{stage}: bad request: {e.message}") from e
         except anthropic.NotFoundError as e:
             self._gone[cfg.model] = e.message[:200]
@@ -474,7 +504,8 @@ class LLM:
         if msg.stop_reason == "max_tokens":
             raise LLMError(f"{stage}: output truncated at max_tokens={cfg.max_tokens}; raise ai.{stage}.max_tokens")
         log.debug("%s: request %s, usage %s", stage, getattr(msg, "_request_id", "?"), msg.usage)
-        return next((b.text for b in msg.content if b.type == "text"), "")
+        text = next((b.text for b in msg.content if b.type == "text"), "")
+        return text if constrained else _json_object(text)
 
     def _call_gemini(self, stage: str, cfg: StageConfig, system: str, user: str, schema: type[BaseModel]) -> str:
         try:

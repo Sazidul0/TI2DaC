@@ -31,25 +31,42 @@ _SECRET_TOKENS = re.compile(
 # from every \b inside a long run the scan is repeated, quadratic on whole-report text.
 _EMAIL = re.compile(r"(?:(?<![\w.%+-])|(?<=(?<![\w.%+-])[.%+-])|(?<=(?<![\w.%+-])[.%+-]{2})|(?<=(?<![\w.%+-])[.%+-]{3}))(?=\w)[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _SID = re.compile(r"\bS-1-5-21-\d{6,10}-\d{6,10}-\d{6,10}(?:-\d{3,})?\b")
-_IPV4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+_IPV4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?!\d|\.\d)")   # `...to 10.0.0.5.` ends a sentence
 _PROFILE = re.compile(r"(?i)((?:[a-z]:)?\\{1,2}Users\\{1,2}|/home/|/Users/)([^\\/\s\"'<>|:*?]+)")
 _DOMAIN_USER = re.compile(r"\b([A-Z][A-Z0-9-]{1,14})\\{1,2}([A-Za-z][\w.$-]{1,30})\b")
 _INTERNAL_TLD = r"(?:local|lan|internal|intranet|intra|corp|lcl|ad|home|localdomain)"
 _FQDN = re.compile(r"(?:(?<![\w-])|(?<=(?<![\w-])-)|(?<=(?<![\w-])--))(?=\w)((?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+)\b")
 _HOSTLIKE = re.compile(r"\b[A-Z]{2,6}-[A-Z]{1,6}\d{0,3}-\d{1,5}\b")   # FIN-WS-0231, NYC-DC-01 (two-segment schemes)
 _UNC = re.compile(r"(?:(?<=^)|(?<=[\s\"'(=,>|]))(\\\\(?:\\\\)?)([A-Za-z0-9][\w-]{0,62}(?:\.[\w-]+)*)(?=\\)", re.M)   # \\server\ only
-_PERSON = re.compile(r"(?<![\w.@\[\\/%-])([a-z])\.([a-z]{4,20})(?![\w@\]\\/-])")
+_PERSON = re.compile(r"(?<![\w.@\[\\/%=|-])([a-z])\.([a-z]{4,20})(?![\w@\]\\/(-]|\.\w)")   # not s.fileno( / w.nessus.org
 _FILE_EXT = set("""enc inc bak conf data dump crypt lock locked""".split() + """dll exe png jpg gif zip rar ps1 bat cmd vbs hta lnk msi scr sys txt log xml htm bin dat tmp cab iso img
 vhd pdf doc xls ppt csv ini cfg jar py sh js docm xlsm docx xlsx pptx json yaml html aspx php com net org""".split())
-_SERVICE_ACCOUNT = re.compile(r"\b(?:svc|srv|sa|adm)[_-][A-Za-z0-9._$-]{2,30}\b", re.I)
+# Whole token only: `sa-id-gen@1.0.4` (an npm package) and longer identifiers are not accounts
+_SERVICE_ACCOUNT = re.compile(r"(?<![\w.@-])(?:svc|srv|sa|adm)[_-][A-Za-z0-9._$-]{2,30}(?<![.-])(?![\w@$-]|\.\w)", re.I)
 _HOSTLIKE2 = re.compile(r"\b(?:DC|SRV|WS|PC|LT|FS|SQL|EXCH|APP|WEB|VM)\d{1,4}\b")
 
 KEEP_USERS = {"public", "default", "all users", "all", "default user", "administrator", "admin", "system", "localservice",
               "networkservice", "<user>", "user", "username", "%username%", "$env:username", "*", "ti2dac", "redacted",
-              "victim", "guest", "test", "sample", "analyst"}
+              "victim", "guest", "test", "sample", "analyst",
+              # profile sub-folders and SAM keys that follow \Users\ in paths, and service accounts in /home
+              "contacts", "searches", "desktop", "documents", "downloads", "favorites", "links", "music", "pictures",
+              "videos", "saved games", "onedrive", "appdata", "names", "httpd", "apache", "www", "www-data", "nginx",
+              "nobody", "daemon", "mysql", "postgres", "git", "ubuntu", "ec2-user", "centos", "kali"}
+# First labels that are never a host name, for names that only look internal by their TLD (user.local, rc.local)
+_NOT_HOST_LABELS = {"user", "users", "admin", "host", "server", "test", "example", "default", "system", "config",
+                    "local", "rc", "java", "catalina", "jboss", "tomcat", "spring", "app"}
 _GENERIC_UNC = {"localhost", "tsclient", "registry", "device", "global??", "microsoft", "wsl$", "wsl.localhost",
                 "live.sysinternals.com", "pipe", "mailslot", "systemroot", "?", ".", "127.0.0.1", "server", "share",
-                "host", "hostname", "computer", "target", "remote", "dc", "fileserver", "domain"}
+                "host", "hostname", "computer", "target", "remote", "dc", "fileserver", "domain", "attacker",
+                "evil", "malicious", "webdav", "davwwwroot"}
+# Windows path / registry segments. In escaped text (Sigma YAML, regexes, JSON) `\\AppData\\Roaming` looks like a
+# UNC path, so `AppData` was sent to the AI as [HOST_1]. No real file server is named like these.
+_PATH_SEGMENTS = {"appdata", "roaming", "local", "locallow", "users", "windows", "system32", "syswow64", "sysnative",
+                  "winsxs", "programdata", "program", "temp", "tmp", "software", "currentversion", "run", "runonce",
+                  "policies", "classes", "services", "currentcontrolset", "controlset001", "control", "wow6432node",
+                  "startup", "desktop", "documents", "downloads", "public", "packages", "prefetch", "tasks", "drivers",
+                  "config", "inetpub", "perflogs", "machine", "explorer", "winlogon", "hklm", "hkcu", "hku", "hkcr",
+                  "start menu", "programs", "microsoft.net", "framework", "framework64", "powershell", "v1.0"}
 _NOT_HOST_SEGMENTS = {"AES", "GCM", "CBC", "SHA", "HMAC", "RSA", "UTF", "ALERT", "CAN", "ZDI", "ICS", "CVE", "CWE", "MAR",
                       "AA", "TLP", "ISO", "IEC", "NIST", "SP", "RFC", "APT", "UNC", "DEV", "STORM", "TA", "KB", "MS", "TAG"}
 _NAMEISH = re.compile(r"[A-Za-z][\w.-]{1,30}")
@@ -168,9 +185,20 @@ def redact(text: str, *, internal_domains: list[str] | None = None, internal_net
     # UNC paths: \\server\share -> host is infrastructure (must run before DOMAIN\user matching)
     def unc(m: re.Match) -> str:
         host = m.group(2)
-        if (PLACEHOLDER.fullmatch(host) or host.lower() in _GENERIC_UNC or _IPV4.fullmatch(host)
+        after = m.string[m.end():m.end() + 2]
+        if len(m.group(1)) == 2 and (after == "\\\\" or (len(after) == 2 and after[1] in ".*+?()[]{}|^$")):
+            # `\\x\\y` is escaped text (YAML/regex/JSON) for the path `\x\y`, and `\\x\.` a regex: a real UNC
+            # there is written `\\\\x\\share`. Plain text writes it `\\x\share`. (Not \d \s \w: shares are
+            # often called \data or \share.)
+            return m.group(0)
+        if (PLACEHOLDER.fullmatch(host) or host.lower() in _GENERIC_UNC or host.lower() in _PATH_SEGMENTS
+                or _IPV4.fullmatch(host)
                 or len(host) < 3 or re.fullmatch(r"x[0-9a-f]{2}", host, re.I)):
             return m.group(0)   # generic names, kernel paths, shellcode escapes; IPs go to the IP pass
+        low = host.lower()
+        if "." in low and not (any(low == d or low.endswith("." + d) for d in domains)
+                               or re.search(rf"\.{_INTERNAL_TLD}$", low)):
+            return m.group(0)   # \\attacker.com\share: a public (attacker) host is an indicator, not an identity
         return m.group(1) + p("HOST", host.split(".")[0])
 
     text = _UNC.sub(unc, text)
@@ -199,9 +227,17 @@ def redact(text: str, *, internal_domains: list[str] | None = None, internal_net
     def fqdn(m: re.Match) -> str:
         name = m.group(1)
         low = name.lower()
-        internal = any(low == d or low.endswith("." + d) for d in domains) or re.search(rf"\.{_INTERNAL_TLD}$", low)
-        if not internal:
-            return name
+        configured = any(low == d or low.endswith("." + d) for d in domains)
+        if not configured:
+            if not re.search(rf"\.{_INTERNAL_TLD}$", low):
+                return name
+            labels = low.split(".")
+            before = m.string[max(0, m.start() - 2):m.start()]
+            if (any(x in _FILE_EXT or x in ("manifest", "config") for x in labels[:-1])   # logonUI.exe.local (DLL redirect)
+                    or labels[0] in _NOT_HOST_LABELS                                      # user.local, rc.local
+                    or (before.endswith("/") and before != "//")                         # /etc/rc.local, not http://
+                    or before == "-D" or m.string[m.end():m.end() + 1] == "="):          # -Dcatalina.home=
+                return name
         if any(low == d for d in domains) or re.fullmatch(rf"[a-z0-9-]+\.{_INTERNAL_TLD}", low) and low.split(".")[0] in [d.split(".")[0] for d in domains]:
             return p("ORG", name)
         shorts.add(name.split(".")[0])

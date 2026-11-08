@@ -408,14 +408,17 @@ def runs():
 
 @app.command("render")
 def rerender(run_id: str, recheck: bool = typer.Option(
-        False, "--recheck", help="Also re-run validation, conversion, field mapping, self-tests and the safety lint "
-                                 "with the current ti2dac version (no AI calls, no tokens)")):
+        False, "--recheck", help="Also re-run validation, conversion, field mapping, self-tests, the safety lint, IOC "
+                                 "extraction and the ATT&CK check with the current ti2dac version (no AI calls, no "
+                                 "tokens)")):
     """Re-render a run's package (after tests/feedback, or after upgrading ti2dac). No AI."""
-    from .pipeline import finalize_package, rebuild_chains
+    from .pipeline import finalize_package, rebuild_chains, recheck_run_metadata
 
     path = _run_dir(run_id)
     record = load_record(path)
     if recheck:
+        for c in recheck_run_metadata(record, path, S()):
+            typer.echo(f"  {c}")
         for p in record.packages:
             ai_queries = [q for q in p.queries if q.method == "llm"]     # keep earlier AI translations
             finalize_package(p, record, S(), None, allow_repair=False)
