@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1125" viewBox="0 0 900 1125" font-family="Helvetica, Arial, sans-serif">
+<style>.t{font-size:16px;font-weight:700}.s{font-size:12px}.n{font-size:13px;font-weight:700;fill:#fff}.h{font-size:15px;font-weight:700}</style>
+<rect width="900" height="1125" fill="#ffffff"/>
+<text x="450" y="34" text-anchor="middle" class="h" fill="#1f2a5a" style="font-size:20px">ti2dac: from a report to a reviewed detection package</text>
+<rect x="60" y="60" width="330" height="80" rx="10" fill="#9b1c31" stroke="#9b1c31" stroke-width="2"/>
+<text x="225.0" y="88" text-anchor="middle" class="t" fill="#fff">Threat-intel report</text>
+<text x="225.0" y="108" text-anchor="middle" class="s" fill="#f6dde2">PDF · HTML · DOCX · EML · Markdown · URL</text>
+<rect x="510" y="60" width="330" height="80" rx="10" fill="#9b1c31" stroke="#9b1c31" stroke-width="2"/>
+<text x="675.0" y="88" text-anchor="middle" class="t" fill="#fff">Internal incident report</text>
+<text x="675.0" y="108" text-anchor="middle" class="s" fill="#f6dde2">plus EVTX / JSON lab events (stay local)</text>
+<path d="M225 140 V168 H450 V196" fill="none" stroke="#9b1c31" stroke-width="2.2"/>
+<polygon points="450.0,196.0 445.0,186.0 455.0,186.0" fill="#9b1c31"/>
+<path d="M675 140 V168 H450" fill="none" stroke="#9b1c31" stroke-width="2.2"/>
+<rect x="300" y="196" width="300" height="74" rx="10" fill="#eef1fa" stroke="#1f2a5a" stroke-width="2"/>
+<text x="450.0" y="224" text-anchor="middle" class="t" fill="#1f2a5a">Reader</text>
+<text x="450.0" y="244" text-anchor="middle" class="s" fill="#3d4766">Opens the file or URL, cleans the text,</text>
+<text x="450.0" y="260" text-anchor="middle" class="s" fill="#3d4766">SHA-256 fingerprint · ingest.py</text>
+<circle cx="316" cy="198" r="14" fill="#9b1c31"/><text x="316" y="203" text-anchor="middle" class="n">1</text>
+<path d="M450 270 V300" fill="none" stroke="#9b1c31" stroke-width="2.2"/>
+<polygon points="450.0,300.0 445.0,290.0 455.0,290.0" fill="#9b1c31"/>
+<rect x="30" y="300" width="840" height="490" rx="14" fill="none" stroke="#1f2a5a" stroke-width="2" stroke-dasharray="9 6"/>
+<text x="450" y="328" text-anchor="middle" class="s" fill="#1f2a5a" style="font-size:14px">ti2dac core engine · Python 3.10+ · pySigma · AI only in stations 4, 6 (and for query gaps in 8)</text>
+<rect x="45" y="350" width="250" height="90" rx="10" fill="#eef1fa" stroke="#1f2a5a" stroke-width="2"/>
+<text x="170.0" y="378" text-anchor="middle" class="t" fill="#1f2a5a">Gatekeeper</text>
+<text x="170.0" y="398" text-anchor="middle" class="s" fill="#3d4766">TLP check, then redact names,</text>
+<text x="170.0" y="414" text-anchor="middle" class="s" fill="#3d4766">hosts, IPs · redact.py</text>
+<circle cx="61" cy="352" r="14" fill="#9b1c31"/><text x="61" y="357" text-anchor="middle" class="n">2</text>
+<rect x="325" y="350" width="250" height="90" rx="10" fill="#eef1fa" stroke="#1f2a5a" stroke-width="2"/>
+<text x="450.0" y="378" text-anchor="middle" class="t" fill="#1f2a5a">Summariser</text>
+<text x="450.0" y="398" text-anchor="middle" class="s" fill="#3d4766">Keep attacker behaviour, set IOCs aside</text>
+<text x="450.0" y="414" text-anchor="middle" class="s" fill="#3d4766">condense.py · iocs.py</text>
+<circle cx="341" cy="352" r="14" fill="#9b1c31"/><text x="341" y="357" text-anchor="middle" class="n">3</text>
+<rect x="605" y="350" width="250" height="90" rx="10" fill="#eef1fa" stroke="#1f2a5a" stroke-width="2"/>
+<text x="730.0" y="378" text-anchor="middle" class="t" fill="#1f2a5a">AI call 1: behaviours</text>
+<text x="730.0" y="398" text-anchor="middle" class="s" fill="#3d4766">Evidence quotes, ATT&amp;CK IDs</text>
+<text x="730.0" y="414" text-anchor="middle" class="s" fill="#3d4766">to Claude / Gemini (redacted text)</text>
+<circle cx="621" cy="352" r="14" fill="#9b1c31"/><text x="621" y="357" text-anchor="middle" class="n">4</text>
+<rect x="605" y="500" width="250" height="90" rx="10" fill="#eef1fa" stroke="#1f2a5a" stroke-width="2"/>
+<text x="730.0" y="528" text-anchor="middle" class="t" fill="#1f2a5a">Verify and rank</text>
+<text x="730.0" y="548" text-anchor="middle" class="s" fill="#3d4766">Quote really in the report? ATT&amp;CK</text>
+<text x="730.0" y="564" text-anchor="middle" class="s" fill="#3d4766">ID exists? · attack.py · quality.py</text>
+<circle cx="621" cy="502" r="14" fill="#9b1c31"/><text x="621" y="507" text-anchor="middle" class="n">5</text>
+<rect x="325" y="500" width="250" height="90" rx="10" fill="#eef1fa" stroke="#1f2a5a" stroke-width="2"/>
+<text x="450.0" y="528" text-anchor="middle" class="t" fill="#1f2a5a">AI call 2: draft rule</text>
+<text x="450.0" y="548" text-anchor="middle" class="s" fill="#3d4766">Sigma, safe simulation guide,</text>
+<text x="450.0" y="564" text-anchor="middle" class="s" fill="#3d4766">test events (per behaviour)</text>
+<circle cx="341" cy="502" r="14" fill="#9b1c31"/><text x="341" y="507" text-anchor="middle" class="n">6</text>
+<rect x="45" y="500" width="250" height="90" rx="10" fill="#eef1fa" stroke="#1f2a5a" stroke-width="2"/>
+<text x="170.0" y="528" text-anchor="middle" class="t" fill="#1f2a5a">Inspect and repair</text>
+<text x="170.0" y="548" text-anchor="middle" class="s" fill="#3d4766">Sigma valid, safety lint, self-test</text>
+<text x="170.0" y="564" text-anchor="middle" class="s" fill="#3d4766">max 2 repairs · sigma_tools · safety</text>
+<circle cx="61" cy="502" r="14" fill="#9b1c31"/><text x="61" y="507" text-anchor="middle" class="n">7</text>
+<rect x="45" y="650" width="250" height="90" rx="10" fill="#eef1fa" stroke="#1f2a5a" stroke-width="2"/>
+<text x="170.0" y="678" text-anchor="middle" class="t" fill="#1f2a5a">Translate</text>
+<text x="170.0" y="698" text-anchor="middle" class="s" fill="#3d4766">Splunk · Elastic · Sentinel</text>
+<text x="170.0" y="714" text-anchor="middle" class="s" fill="#3d4766">Defender · CrowdStrike · QRadar</text>
+<text x="170.0" y="730" text-anchor="middle" class="s" fill="#3d4766">OpenSearch · Loki · Wazuh</text>
+<circle cx="61" cy="652" r="14" fill="#9b1c31"/><text x="61" y="657" text-anchor="middle" class="n">8</text>
+<rect x="325" y="650" width="250" height="90" rx="10" fill="#eef1fa" stroke="#1f2a5a" stroke-width="2"/>
+<text x="450.0" y="678" text-anchor="middle" class="t" fill="#1f2a5a">Package</text>
+<text x="450.0" y="698" text-anchor="middle" class="s" fill="#3d4766">Rules, queries, guides, tests,</text>
+<text x="450.0" y="714" text-anchor="middle" class="s" fill="#3d4766">ADS docs, ATT&amp;CK layer · render.py</text>
+<circle cx="341" cy="652" r="14" fill="#9b1c31"/><text x="341" y="657" text-anchor="middle" class="n">9</text>
+<rect x="605" y="650" width="250" height="90" rx="10" fill="#9b1c31" stroke="#9b1c31" stroke-width="2"/>
+<text x="730.0" y="678" text-anchor="middle" class="t" fill="#fff">output/&lt;run-id&gt;/</text>
+<text x="730.0" y="698" text-anchor="middle" class="s" fill="#f6dde2">Detection package,</text>
+<text x="730.0" y="714" text-anchor="middle" class="s" fill="#f6dde2">ready for human review</text>
+<path d="M295 395 H325" fill="none" stroke="#9b1c31" stroke-width="2.2"/>
+<polygon points="325.0,395.0 315.0,390.0 315.0,400.0" fill="#9b1c31"/>
+<path d="M295 705 H325" fill="none" stroke="#9b1c31" stroke-width="2.2"/>
+<polygon points="325.0,705.0 315.0,700.0 315.0,710.0" fill="#9b1c31"/>
+<path d="M575 395 H605" fill="none" stroke="#9b1c31" stroke-width="2.2"/>
+<polygon points="605.0,395.0 595.0,390.0 595.0,400.0" fill="#9b1c31"/>
+<path d="M575 705 H605" fill="none" stroke="#9b1c31" stroke-width="2.2"/>
+<polygon points="605.0,705.0 595.0,700.0 595.0,710.0" fill="#9b1c31"/>
+<path d="M730 440 V500" fill="none" stroke="#9b1c31" stroke-width="2.2"/>
+<polygon points="730.0,500.0 725.0,490.0 735.0,490.0" fill="#9b1c31"/>
+<path d="M605 545 H575" fill="none" stroke="#9b1c31" stroke-width="2.2"/>
+<polygon points="575.0,545.0 585.0,540.0 585.0,550.0" fill="#9b1c31"/>
+<path d="M325 545 H295" fill="none" stroke="#9b1c31" stroke-width="2.2"/>
+<polygon points="295.0,545.0 305.0,540.0 305.0,550.0" fill="#9b1c31"/>
+<path d="M170 590 V650" fill="none" stroke="#9b1c31" stroke-width="2.2"/>
+<polygon points="170.0,650.0 165.0,640.0 175.0,640.0" fill="#9b1c31"/>
+<text x="450" y="772" text-anchor="middle" class="s" fill="#1f2a5a">Nothing the model writes is executed. Only the redacted, trimmed text ever leaves your machine.</text>
+<path d="M730 790 V822" fill="none" stroke="#9b1c31" stroke-width="2.2"/>
+<polygon points="730.0,822.0 725.0,812.0 735.0,812.0" fill="#9b1c31"/>
+<rect x="30" y="822" width="840" height="190" rx="14" fill="#fbf3f5" stroke="#9b1c31" stroke-width="2"/>
+<text x="450" y="850" text-anchor="middle" class="h" fill="#9b1c31">Human validation and hand-over (people, helped by the tool)</text>
+<rect x="45" y="872" width="250" height="120" rx="10" fill="#eef1fa" stroke="#1f2a5a" stroke-width="2"/>
+<text x="170.0" y="900" text-anchor="middle" class="t" fill="#1f2a5a">Test with real evidence</text>
+<text x="170.0" y="920" text-anchor="middle" class="s" fill="#3d4766">Run the simulation in YOUR lab,</text>
+<text x="170.0" y="936" text-anchor="middle" class="s" fill="#3d4766">replay the events locally, or run</text>
+<text x="170.0" y="952" text-anchor="middle" class="s" fill="#3d4766">the query in your SIEM, then</text>
+<text x="170.0" y="968" text-anchor="middle" class="s" fill="#3d4766">record the result · replay.py</text>
+<circle cx="61" cy="874" r="14" fill="#9b1c31"/><text x="61" y="879" text-anchor="middle" class="n">10</text>
+<rect x="325" y="872" width="250" height="120" rx="10" fill="#eef1fa" stroke="#1f2a5a" stroke-width="2"/>
+<text x="450.0" y="900" text-anchor="middle" class="t" fill="#1f2a5a">Review and approve</text>
+<text x="450.0" y="920" text-anchor="middle" class="s" fill="#3d4766">Corrections become a new version</text>
+<text x="450.0" y="936" text-anchor="middle" class="s" fill="#3d4766">Approver must differ from author</text>
+<text x="450.0" y="952" text-anchor="middle" class="s" fill="#3d4766">draft &gt; reviewed &gt; approved</text>
+<text x="450.0" y="968" text-anchor="middle" class="s" fill="#3d4766">feedback.py · users.py</text>
+<circle cx="341" cy="874" r="14" fill="#9b1c31"/><text x="341" y="879" text-anchor="middle" class="n">11</text>
+<rect x="605" y="872" width="250" height="120" rx="10" fill="#eef1fa" stroke="#1f2a5a" stroke-width="2"/>
+<text x="730.0" y="900" text-anchor="middle" class="t" fill="#1f2a5a">Export to Git / CI</text>
+<text x="730.0" y="920" text-anchor="middle" class="s" fill="#3d4766">Approved rules only,</text>
+<text x="730.0" y="936" text-anchor="middle" class="s" fill="#3d4766">with tests and queries</text>
+<text x="730.0" y="952" text-anchor="middle" class="s" fill="#3d4766">Your pipeline does the deployment</text>
+<circle cx="621" cy="874" r="14" fill="#9b1c31"/><text x="621" y="879" text-anchor="middle" class="n">12</text>
+<path d="M295 932 H325" fill="none" stroke="#9b1c31" stroke-width="2.2"/>
+<polygon points="325.0,932.0 315.0,927.0 315.0,937.0" fill="#9b1c31"/>
+<path d="M575 932 H605" fill="none" stroke="#9b1c31" stroke-width="2.2"/>
+<polygon points="605.0,932.0 595.0,927.0 595.0,937.0" fill="#9b1c31"/>
+<rect x="30" y="1040" width="840" height="64" rx="10" fill="#fff" stroke="#9b1c31" stroke-width="2" stroke-dasharray="6 5"/>
+<text x="450" y="1066" text-anchor="middle" class="s" fill="#9b1c31" style="font-size:13px;font-weight:700">ti2dac never runs simulation scripts and never connects to your SIEM.</text>
+<text x="450" y="1088" text-anchor="middle" class="s" fill="#1f2a5a">Treat output as a draft until real SIEM testing and review are done (steps 10 to 12).</text>
+</svg>
