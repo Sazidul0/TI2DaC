@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import sys
 import threading
 import uuid
 import warnings
@@ -10,6 +11,7 @@ from datetime import date
 import pyparsing
 import yaml
 from sigma import conditions as _sigma_conditions
+from sigma.types import SigmaType
 
 from . import correlate
 from .models import FieldMapping, QueryResult, SigmaDraft
@@ -30,6 +32,12 @@ def _serialized(parse):
 
 
 _sigma_conditions.SigmaCondition.parse = _serialized(_sigma_conditions.SigmaCondition.parse)
+
+if sys.version_info >= (3, 14):
+    def _to_plain_python_314(self):
+        return self.__getattribute__(next(iter(self.__class__.__annotations__)))
+
+    SigmaType.to_plain = _to_plain_python_314
 
 RULE_NAMESPACE = uuid.UUID("5b1f3c2e-8a0d-4f6e-9c3a-7d2b1e0f4a91")
 

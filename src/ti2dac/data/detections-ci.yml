@@ -23,7 +23,7 @@ jobs:
           python-version: "3.12"
       - name: Install ti2dac
         # Pin to your internal ti2dac release (git tag or private index).
-        run: pip install "ti2dac @ git+https://github.com/YOUR-ORG/ti2dac@v0.1.0"
+        run: pip install "ti2dac @ git+https://github.com/Sazidul0/ti2dac@v0.1.1"
       - name: Sigma validation
         run: ti2dac check $(find rules -name '*.yml')
         env:

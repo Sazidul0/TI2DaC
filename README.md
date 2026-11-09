@@ -17,6 +17,8 @@
 
 # ti2dac: Threat Intelligence → Detection-as-Code
 
+Current release: **0.1.1**
+
 ti2dac turns a **threat-intelligence report or an internal incident report** into a reviewed, tested detection package:
 
 - the attacker behaviours (TTPs) in the report, with evidence quotes checked against the source and verified MITRE ATT&CK mappings
@@ -36,7 +38,7 @@ validation, documentation, safety checks and redaction. This keeps token use low
 
 ## Install
 
-Requires Python 3.10 or newer.
+Requires Python 3.10 or newer. CI tests Python 3.10, 3.12 and 3.14.
 
 ```bash
 pip install ti2dac            # or: pipx install ti2dac
