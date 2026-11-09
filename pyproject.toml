@@ -25,17 +25,23 @@ dependencies = [
     "pydantic>=2.7",
     "pysigma>=0.11,<0.12",
     "pyparsing>=3.1,<3.2",          # pySigma 0.11 condition parser breaks on pyparsing 3.2+
-    "sigma-cli>=1.0",
-    "pySigma-backend-splunk",
-    "pySigma-backend-elasticsearch",
-    "pySigma-backend-kusto",
-    "pySigma-backend-crowdstrike",
-    "pySigma-backend-qradar-aql",
-    "pySigma-backend-opensearch",
-    "pySigma-backend-loki",
-    "pySigma-pipeline-sysmon",
-    "pySigma-pipeline-windows",
+    # Exact pins: the sigma backends are tested together at these versions.
+    # Unpinned, pip backtracks through dozens of releases during install.
+    "sigma-cli==1.0.6",
+    "pySigma-backend-splunk==1.1.3",
+    "pySigma-backend-elasticsearch==1.1.6",
+    "pySigma-backend-kusto==0.4.5",
+    "pySigma-backend-crowdstrike==2.0.1",
+    "pySigma-backend-qradar-aql==0.3.2",
+    "pySigma-backend-opensearch==1.0.4",
+    "pySigma-backend-loki==0.12.4",
+    "pySigma-pipeline-sysmon==1.0.4",
+    "pySigma-pipeline-windows==1.2.0",
     "pySigma-backend-sqlite==0.2.0",  # local rule evaluation (self-tests, replay); later versions need pySigma 2
+    # pySigma-backend-qradar-aql needs regex<2024; dateparser>=1.4 (pulled in via trafilatura) needs regex>=2024.
+    # These two pins are the combination the project is tested with.
+    "regex==2023.12.25",
+    "dateparser==1.2.1",
     "trafilatura>=1.8",
     "beautifulsoup4",
     "lxml",
