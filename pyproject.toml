@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,18 @@ version = "0.1.0"
 description = "Threat Intelligence to Detection-as-Code: TI report -> Sigma -> multi-SIEM queries + safe simulation guides"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sazidul0" }]
+keywords = ["threat-intelligence", "sigma", "detection-as-code", "siem", "splunk", "elasticsearch", "security"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Information Technology",
+    "Topic :: Security",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: OS Independent",
+]
 dependencies = [
     "anthropic>=2.3",
     "pydantic>=2.7",
@@ -43,6 +55,11 @@ dependencies = [
 dev = ["pytest>=8"]
 gemini = ["google-genai>=1.30"]
 evtx = ["python-evtx>=0.7", "defusedxml>=0.7"]
+
+[project.urls]
+Homepage = "https://github.com/Sazidul0/TI2DaC"
+Repository = "https://github.com/Sazidul0/TI2DaC"
+Issues = "https://github.com/Sazidul0/TI2DaC/issues"
 
 [project.scripts]
 ti2dac = "ti2dac.cli:app"
