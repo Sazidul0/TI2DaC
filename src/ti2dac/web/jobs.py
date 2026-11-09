@@ -92,6 +92,7 @@ def merge_meanwhile(settings: Settings, record, path: Path, before: dict) -> Non
         used.add(p.slug)
     record.packages = kept + others + mine
     record.chains = disk.chains   # jobs only rebuild chains; definitions come from people
+    record.review = disk.review   # reviews and decisions on them come from review jobs and people
     gone = set(before["warnings"]) - set(record.warnings)   # the job resolved them (e.g. a retried rule now exists)
     record.warnings = list(dict.fromkeys([w for w in disk.warnings if w not in gone]
                                          + [w for w in record.warnings if w not in before["warnings"]]))
@@ -144,6 +145,41 @@ def apply_feedback(settings: Settings, store: Store, progress: Progress, *, fid:
         merge_meanwhile(settings, record, Path(path), before)
         rerender(settings, store, record, Path(path))
     return fb["run_id"]
+
+
+def ai_review(settings: Settings, store: Store, progress: Progress, *, run_id: str, path: str, provider: str,
+              model: str, actor: str) -> str:
+    """Review a finished run (review.py). provider "" = ti2dac's code checks only, no AI call."""
+    from .. import review
+    from ..llm import estimate_cost
+    from ..models import Usage
+
+    record = load_record(Path(path))
+    llm = None
+    if provider:
+        problem = review.policy_problem(record, settings, provider)
+        if problem:
+            raise ValueError(problem)
+        rs = review.settings_for(settings, provider, model)
+        llm = LLM(rs, Usage(), tlp=record.report.tlp_effective)
+    else:
+        rs = settings
+    result = review.run_review(record, Path(path), rs, llm, actor, progress)
+    with run_lock(settings, run_id):
+        disk = load_record(Path(path))
+        # Decisions made on the previous review while this one ran are kept for identical findings.
+        review._carry(result.findings, disk.review)
+        disk.review = result
+        if llm is not None:   # the review's AI usage counts towards the run's
+            disk.usage = type(disk.usage).model_validate(
+                _add_delta(disk.usage.model_dump(), llm.usage.model_dump(), Usage().model_dump()))
+            disk.usage.unpriced_models = sorted({*disk.usage.unpriced_models, *llm.usage.unpriced_models})
+            disk.usage.estimated_cost_usd = estimate_cost(disk.usage, settings.ai.prices)
+        rerender(settings, store, disk, Path(path))
+    store.audit(actor, "run.ai_review", {"run_id": run_id, "provider": provider or "code checks", "model": model,
+                                         "findings": len(result.findings), "discarded": len(result.discarded),
+                                         "cost_usd": result.cost_usd})
+    return run_id
 
 
 # --------------------------------------------------------------------------- running one

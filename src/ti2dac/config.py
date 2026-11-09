@@ -35,6 +35,10 @@ class AIConfig:
     generate: StageConfig = field(default_factory=lambda: StageConfig(effort="high", max_tokens=24000))
     repair: StageConfig = field(default_factory=lambda: StageConfig(effort="medium", max_tokens=8000))
     translate: StageConfig = field(default_factory=lambda: StageConfig(effort="low", max_tokens=4000))
+    # AI review of a finished run (on request): reads the report and the run's outputs and lists mistakes.
+    # Reasoning-heavy, so high effort. A reviewer model other than the one that wrote the rules gives a more
+    # independent second opinion; it can be picked per review (web) or saved (`ti2dac model --stage review`).
+    review: StageConfig = field(default_factory=lambda: StageConfig(effort="high", max_tokens=16000))
     # Server-side refusal fallback (security content can trip the cyber classifier).
     server_side_fallback: bool = True
     # Provider to use when the primary is down (connection error, timeout, 5xx/529 after retries); "" = off.
@@ -47,6 +51,9 @@ class AIConfig:
     max_repair_attempts: int = 2
     # Report text sent to the analysis call is condensed to roughly this many tokens.
     input_token_budget: int = 6000
+    # Report text sent with an AI review is condensed to roughly this many tokens (larger than the analysis
+    # budget: the reviewer checks details such as patterns and lengths that the analysis may have skipped).
+    review_input_token_budget: int = 16000
     max_behaviours: int = 10
     response_cache: bool = True
     max_lessons_in_prompt: int = 5
@@ -251,7 +258,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
 
 # --------------------------------------------------------------------------- model choice (web AI page / `ti2dac model`)
 PROVIDERS = ("anthropic", "gemini")
-STAGES = ("analyze", "generate", "repair", "translate")
+STAGES = ("analyze", "generate", "repair", "translate", "review")
 ENV_MODEL_VARS = ("TI2DAC_PROVIDER", "TI2DAC_MODEL")
 
 

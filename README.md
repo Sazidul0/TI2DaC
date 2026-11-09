@@ -172,7 +172,7 @@ ti2dac feedback add <run-id> rule-001 --artifact sigma_rule --category too_broad
 ti2dac review <run-id> rule-001 --status approved  # as a different user than the author
 ti2dac export <run-id> --repo ../detections        # approved rules into your Git detection repo
 ti2dac ai-status                                   # key, limits, requests and tokens today
-ti2dac model                                       # list models with prices; `ti2dac model <id> [--stage generate]` to choose
+ti2dac model                                       # list models with prices; `ti2dac model <id> [--stage generate]` to choose (stages: analyze, generate, repair, translate, review)
 ```
 
 Each `run` prints its AI calls and tokens at the end. The package folder is `output/<run-id>/`; start with `report-summary.md`.
@@ -347,6 +347,7 @@ Add a SIEM: install its pySigma backend and add a `Target` in `src/ti2dac/target
 
 ## Review, feedback and governance
 
+0. **Second opinion (optional):** the **AI review** card on a run's page (or `ti2dac ai-review <run> [--model M] [--provider P]`) checks the whole run against its report. ti2dac's own checks run first and cost nothing: selections the condition never uses, KQL string operators holding a `*` (a literal star in KQL, so the query never matches), IOCs cut in two at a PDF line break, and encryption keys listed as file hashes. Then the model you pick for that review (any provider whose key is set and whose TLP policy allows the report; the default is the `review` stage on the AI page) reads the report and the run's outputs and lists mistakes. A finding that rests on the report must quote it; quotes are machine-checked, and findings whose quote is not in the report are set aside as *discarded*, not shown as findings. Pick "ti2dac checks only" for a free review without an AI call. Findings change nothing until someone decides: **Accept** on a rule, query or simulation finding opens feedback on that rule (step 2 then fixes it as a new version); on an analysis or IOC finding it adds a run warning. **Dismiss** records why, and dismissed findings are passed to the next review so it does not raise them again. The review is marked *out of date* when a rule changes afterwards, and the runs list shows each run's review state.
 1. **Report problems:** `ti2dac feedback add <run> rule-001 --artifact sigma_rule --category too_broad_fp --comment "..."`, or use the form on each rule in the web UI. Categories cover hallucinated evidence, wrong ATT&CK mapping, wrong logsource or field, logic error, false positives, false negatives, syntax, translation, unsafe simulation, simulation not triggering, incomplete cleanup and documentation.
 2. **Fix:** attach a corrected rule, which is validated and saved as **v2** (v1 is archived in `rules/history/`), or use `ti2dac feedback apply <id> --ai`. Every new version starts as a draft.
 3. **Learn:** applied feedback becomes a short *lesson*, stored per technique and log source. Up to 5 relevant lessons are added to future generation prompts. A lesson keeps the TLP of the run it came from and only reaches runs of the same or a stricter TLP whose provider may receive it. Manage them with `ti2dac lessons`.
@@ -470,6 +471,7 @@ output/<run-id>/
 | `client list / init / check` | Client profiles: list, write a starter, validate and preview queries |
 | `replay`, `rule-test` | Run a rule against lab/incident logs; run rule unit tests (CI) |
 | `test record`, `review` | Record test results and dispositions; approve or reject rules |
+| `ai-review <run> [--model M\|code] [--provider P] [--show]` | Second opinion on a run against its report: ti2dac's checks, then the chosen model; prints the findings |
 | `feedback add / list / apply / resolve / export`, `lessons` | Feedback loop and the lessons learned from it |
 | `export`, `sigmahq-sync` | Hand-off to a detection repository; refresh the SigmaHQ duplicate index |
 | `ai-status [--reset]` | AI provider health: key configured, limits hit, requests today; clear a pause |

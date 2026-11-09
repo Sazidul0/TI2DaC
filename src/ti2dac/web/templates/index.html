@@ -160,31 +160,32 @@
   <div class="card-body flush">
   {% if runs %}
     <div class="table-wrap"><table class="table" id="runs-table">
-      <thead><tr><th>Report</th><th>Rules</th><th>Created</th><th class="num">AI calls</th><th class="num">Tokens in / out</th><th class="num">Est. cost</th><th class="shrink"><span class="sr-only">Actions</span></th></tr></thead>
+      <thead><tr><th>Report</th><th>Rules</th><th>AI review</th><th>Created</th><th class="num">AI calls</th><th class="num">Tokens in / out</th><th class="num">Est. cost</th><th class="shrink"><span class="sr-only">Actions</span></th></tr></thead>
       <tbody>
       {% for r in runs %}<tr data-row>
-        <td style="min-width:260px">
+        <td style="min-width:220px">
           <a class="cell-title" href="/runs/{{ r.run_id }}">{{ r.title }}</a>
           <div class="cell-sub row" style="gap:6px">
             {% if r.kind == "incident" %}<span class="badge sq warn">incident</span>{% endif %}
             {% if r.tlp %}<span class="badge sq {{ ui.tone(r.tlp) }}">{{ r.tlp }}</span>{% endif %}
-            {% set src = r.source or "" %}<span class="truncate" style="max-width:340px" title="{{ src }}">{{ src.split('/')[2] if src.startswith('http') and src.count('/') >= 2 else src }}</span>
+            {% set src = r.source or "" %}<span class="truncate" style="max-width:240px" title="{{ src }}">{{ src.split('/')[2] if src.startswith('http') and src.count('/') >= 2 else src }}</span>
           </div>
         </td>
         <td class="nowrap">{% if r.rules %}<span class="cell-title">{{ r.rules }}</span> <span class="muted">/ {{ r.behaviours }} behaviours</span>
           {% if r.approved %}<div class="cell-sub ok">{{ r.approved }} approved</div>{% endif %}
           {% else %}<span class="muted">{{ r.behaviours }} behaviours, no rules</span>{% endif %}</td>
+        <td class="nowrap"><a href="/runs/{{ r.run_id }}#ai-review" style="text-decoration:none">{{ ui.review_badge(r.review, r.run_id in reviewing) }}</a></td>
         <td class="nowrap muted">{{ ui.short_date(r.created_at) }}</td>
         <td class="num">{{ r.usage.calls or 0 }}{% if r.usage.cached_calls %} <span class="muted">(+{{ r.usage.cached_calls }} cached)</span>{% endif %}</td>
         <td class="num">{{ r.usage.input_tokens|tok }} / {{ r.usage.output_tokens|tok }}</td>
         <td class="num">{% if r.usage.estimated_cost_usd %}${{ "%.4f"|format(r.usage.estimated_cost_usd) }}{% else %}<span class="muted">-</span>{% endif %}</td>
         <td class="shrink"><div class="row" style="flex-wrap:nowrap;gap:4px">
           <a class="btn ghost icon sm" href="/runs/{{ r.run_id }}/download" title="Download package (zip)" aria-label="Download {{ r.title }} as zip">{{ ui.icon("download") }}</a>
-          <a class="btn outline sm" href="/runs/{{ r.run_id }}">Open{{ ui.icon("arrow-right", "sm") }}</a>
+          <a class="btn outline icon sm" href="/runs/{{ r.run_id }}" title="Open run" aria-label="Open {{ r.title }}">{{ ui.icon("arrow-right", "sm") }}</a>
           {% if role == "admin" or user == r.created_by %}<form method="post" action="/runs/{{ r.run_id }}/delete" data-confirm="Delete this run? Its rules, queries, simulations, the uploaded report, feedback, test results and the lessons learned from it are removed for good. The audit log keeps a record of the deletion.">
             <button class="btn ghost icon sm" type="submit" title="Delete run" aria-label="Delete {{ r.title }}" style="color:var(--destructive)">{{ ui.icon("trash") }}</button></form>{% endif %}</div></td>
       </tr>{% endfor %}
-      <tr data-filter-empty hidden><td colspan="7">{{ ui.empty("No matching runs", "Try a different word, or clear the filter.", "search") }}</td></tr>
+      <tr data-filter-empty hidden><td colspan="8">{{ ui.empty("No matching runs", "Try a different word, or clear the filter.", "search") }}</td></tr>
       </tbody>
     </table></div>
   {% else %}

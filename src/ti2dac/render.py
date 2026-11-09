@@ -543,6 +543,22 @@ def _write_summary(record: RunRecord, out: Path, results: list[dict]) -> None:
           f"{len(i.mutexes)} mutexes · {len(i.cves)} CVEs" + (f" ({', '.join(i.cves[:8])})" if i.cves else "")
           + (f" · {len(i.excluded)} values left out as not indicators (keys, IDs, lab addresses, legitimate services "
              "and system files; listed with the reason under `excluded`)" if i.excluded else ""), ""]
+    rv = record.review
+    if rv is not None:
+        who = f"`{rv.model}` ({rv.provider})" if rv.provider else "ti2dac checks only (no AI call)"
+        L += ["## AI review", "", f"Reviewed {rv.created_at[:16].replace('T', ' ')} UTC by {rv.created_by or '-'} with {who}: "
+              f"{len(rv.findings)} finding(s), {sum(f.status == 'open' for f in rv.findings)} open"
+              + (f", {len(rv.discarded)} discarded (quote not in the report)" if rv.discarded else "") + "."]
+        if rv.versions != {p.slug: p.version for p in record.packages}:
+            L.append("**Out of date:** rules changed after this review.")
+        if rv.summary:
+            L += ["", rv.summary]
+        if rv.findings:
+            L += ["", "| # | Source | Severity | Target | Finding | Decision |", "|---|---|---|---|---|---|"]
+            L += [f"| {f.id} | {'ti2dac' if f.source == 'code' else 'AI'} | {f.severity} | {_cell(f.target + ('/' + f.siem if f.siem else ''))} | "
+                  f"{_cell(f.problem)}" + (f" Fix: {_cell(f.suggested_fix)}" if f.suggested_fix else "")
+                  + f" | {f.status}{(' (' + _cell(f.note) + ')') if f.note else ''} |" for f in rv.findings]
+        L.append("")
     items = [f"- {w}" for w in record.warnings]
     for p in record.packages:
         items += [f"- **{p.slug} quality:** {x}" for x in p.quality_warnings]

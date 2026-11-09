@@ -45,9 +45,14 @@ def _noop(_: str) -> None:
 
 
 # --------------------------------------------------------------------------- evidence
+# Private Use Area code points: some PDF fonts map punctuation ("-", ":", "(", "[") to them, so the extracted
+# text reads "202608" where the page shows "2026-08". A model quoting the page drops them.
+_PRIVATE_USE = re.compile("[-]")
+
+
 def _norm(s: str) -> str:
     s = s.replace("\\", "").replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
-    return re.sub(r"\s+", " ", s).strip().lower()
+    return re.sub(r"\s+", " ", _PRIVATE_USE.sub("", s)).strip().lower()
 
 
 def verify_evidence(quote: str, norm_source: str) -> bool:

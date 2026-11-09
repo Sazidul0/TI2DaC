@@ -7,8 +7,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}ti2dac{% endblock %} · TI → Detection-as-Code</title>
 <script>try{var t=localStorage.getItem("ti2dac-theme");if(t)document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
-<link rel="stylesheet" href="/static/app.css?v={{ version }}">
-<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="stylesheet" href="/static/app.css?v={{ asset_v }}">
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v={{ asset_v }}">
 {% block head %}{% endblock %}
 </head>
 <body>
@@ -69,6 +69,6 @@
     <main class="content" id="content">{% block content %}{% endblock %}</main>
   </div>
 </div>
-<script src="/static/app.js?v={{ version }}" defer></script>
+<script src="/static/app.js?v={{ asset_v }}" defer></script>
 </body>
 </html>

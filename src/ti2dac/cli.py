@@ -11,7 +11,7 @@ import typer
 
 from . import attack, obs
 from . import sigma_tools as st
-from .config import Settings, load_settings
+from .config import STAGES, Settings, load_settings
 from .feedback import ARTIFACTS, CATEGORIES, REVIEW_STATES, SEVERITIES, TEST_RESULTS, Store
 from .ingest import IngestError, load_report
 from .llm import LLM, LLMError, estimate_cost
@@ -634,15 +634,66 @@ def review(run_id: str, slug: str, status: str = typer.Option(..., help="|".join
     typer.echo(f"{slug}: review={status}, sigma status={sigma_status} ({path}/rules/{rule_filename(pkg)})")
 
 
+@app.command("ai-review")
+def ai_review_cmd(run_id: str,
+                  model: str = typer.Option("", "--model", "-m", help="Reviewer model (default: the review stage's "
+                                                                      "model). 'code' = ti2dac's checks only, no AI call"),
+                  provider: str = typer.Option("", "--provider", "-p", help="anthropic or gemini (default: the active provider)"),
+                  show: bool = typer.Option(False, "--show", help="Print the latest review instead of running a new one")):
+    """Second opinion on a finished run: ti2dac's checks, then the chosen model reads the report and the outputs
+    and lists mistakes. Changes nothing in the run; accept or dismiss findings on the run page."""
+    from . import modelchoice
+    from . import review as rv
+    from .web.jobs import ai_review
+
+    s = S()
+    path = _run_dir(run_id)
+    if not show:
+        prov, mid = "", ""
+        if model != "code":
+            if not s.ai.enabled:
+                _fail("AI is disabled; use --model code for ti2dac's own checks")
+            prov = provider or s.ai.provider
+            if prov not in modelchoice.PROVIDER_LABELS:
+                _fail(f"unknown provider {prov!r} (anthropic or gemini)")
+            mid = model or (s.ai.review.model if prov == s.ai.provider else modelchoice.current(s, prov)["review"])
+            if mid not in {m["id"] for m in modelchoice.available(s, prov)}:
+                _fail(f"{mid!r} is not a {modelchoice.PROVIDER_LABELS[prov]} model ti2dac knows (see `ti2dac model -p {prov}`)")
+            record = load_record(path)
+            est = rv.estimate_cost(rv.estimate_tokens(record, s), mid, s)
+            typer.echo(f"reviewing with {prov} {mid}" + (f" (est. ${est:.2f})" if est is not None else " (price unknown)"), err=True)
+        try:
+            ai_review(s, _store(), _progress, run_id=run_id, path=str(path), provider=prov, model=mid, actor=_actor())
+        except (LLMError, ValueError) as e:
+            _fail(str(e))
+    record = load_record(path)
+    if record.review is None:
+        _fail(f"run {run_id} has not been reviewed yet")
+    r = record.review
+    typer.echo(f"review {r.created_at} by {r.created_by or '-'}: "
+               + (f"{r.provider} {r.model}, est. ${r.cost_usd:.4f}" if r.provider else "ti2dac checks only"))
+    changed = rv.out_of_date(record)
+    if changed:
+        typer.secho(f"out of date: {', '.join(changed)}", fg=typer.colors.YELLOW)
+    if r.summary:
+        typer.echo(r.summary)
+    for f in r.findings:
+        tgt = f.target + (f"/{f.siem}" if f.siem else "")
+        typer.echo(f"  {f.id:4} {f.status:9} {f.severity:8} {'ti2dac' if f.source == 'code' else 'AI':6} {tgt:24} {f.problem}")
+        if f.suggested_fix:
+            typer.echo(f"{'':58}fix: {f.suggested_fix}")
+    if r.discarded:
+        typer.echo(f"  ({len(r.discarded)} AI finding(s) discarded: their quote is not in the report)")
+
+
 @app.command("model")
 def model_cmd(model: str = typer.Argument("", help="Model id to use, e.g. claude-sonnet-5-5. Omit to list the choices"),
               provider: str = typer.Option("", "--provider", "-p", help="anthropic or gemini (default: the active provider)"),
-              stage: list[str] = typer.Option([], "--stage", help="Only these stages (analyze, generate, repair, translate); "
+              stage: list[str] = typer.Option([], "--stage", help="Only these stages (analyze, generate, repair, translate, review); "
                                                                   "repeat the option for several. Default: every stage"),
               refresh: bool = typer.Option(False, "--refresh", help="Fetch the models your key can use first (no tokens)")):
     """Show or choose the AI model. Same setting as the web AI page; TI2DAC_PROVIDER / TI2DAC_MODEL still win."""
     from . import modelchoice
-    from .config import STAGES
 
     s = S()
     prov = provider or s.ai.provider
@@ -713,7 +764,7 @@ def ai_status(reset: bool = typer.Option(False, "--reset", help="Clear a pause a
     blocked = aistatus.block_reason(s.state_dir, prov, s.ai.daily_request_limit)
     cap = f"/{s.ai.daily_request_limit}" if s.ai.daily_request_limit else " (no cap)"
     typer.echo(f"provider       : {prov}  (AI {'enabled' if s.ai.enabled else 'disabled'})")
-    typer.echo(f"models         : " + ", ".join(f"{k}={getattr(s.ai, k).model}" for k in ("analyze", "generate", "repair", "translate")))
+    typer.echo(f"models         : " + ", ".join(f"{k}={getattr(s.ai, k).model}" for k in STAGES))
     typer.echo(f"credentials    : {aistatus.key_status(prov)}")
     typer.echo(f"state          : {st.get('state', 'ok')}" + (f"  (resets in {aistatus.human_wait(st['retry_at'])})" if st.get("retry_at") else ""))
     typer.echo(f"requests today : {st.get('requests_today', 0)}{cap}")

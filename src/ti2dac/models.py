@@ -218,6 +218,62 @@ class TranslationDraft(BaseModel):
     confidence: Literal["low", "medium", "high"]
 
 
+# --------------------------------------------------------------------------- AI review of a run
+# Same keys as feedback.CATEGORIES (a test keeps them in step): an accepted finding becomes rule feedback.
+ReviewCategory = Literal[
+    "hallucinated_evidence", "not_a_behaviour", "missed_behaviour", "incorrect_attack_mapping", "wrong_ioc",
+    "wrong_logsource", "wrong_field_name", "logic_error", "too_broad_fp", "too_narrow_fn", "syntax_error",
+    "translation_error", "unsafe_simulation", "simulation_no_trigger", "incomplete_cleanup", "documentation_error",
+    "other",
+]
+ReviewArea = Literal["analysis", "ioc", "rule", "query", "simulation"]
+Severity = Literal["critical", "high", "medium", "low"]
+
+
+class ReviewFindingDraft(BaseModel):
+    area: ReviewArea
+    target: str = Field(description="B<n> (analysis), rule-<nnn> (rule/query/simulation) or iocs.<type> (ioc)")
+    siem: str = Field(description="For area=query: the query's target id from <outputs>; else ''")
+    category: ReviewCategory
+    severity: Severity
+    problem: str = Field(description="The specific mistake, <= 300 chars")
+    report_quote: str = Field(description="Verbatim quote from <report> the finding rests on, or ''")
+    suggested_fix: str = Field(description="Concrete correction (value, regex, field, table)")
+
+
+class ReviewDraft(BaseModel):
+    summary: str = Field(description="Overall verdict, <= 2 sentences")
+    findings: list[ReviewFindingDraft]
+
+
+class ReviewFinding(ReviewFindingDraft):
+    id: str                                   # F1, F2, ... within one review
+    source: Literal["code", "ai"]             # ti2dac's own checks, or the reviewer model
+    quote_verified: bool = False              # report_quote found in the report (machine-checked)
+    status: Literal["open", "accepted", "dismissed"] = "open"
+    decided_by: str = ""
+    decided_at: str = ""
+    note: str = ""                            # why it was dismissed, or what accepting it did
+    feedback_id: int = 0                      # rule feedback created when a rule finding was accepted
+
+
+class RunReview(BaseModel):
+    """One review of a run. Findings never change the run by themselves; an analyst accepts or dismisses them."""
+    created_at: str
+    created_by: str = ""
+    provider: str = ""                        # "" = ti2dac's code checks only (no AI call)
+    model: str = ""
+    prompt_version: str = ""
+    summary: str = ""
+    findings: list[ReviewFinding] = []
+    # AI findings dropped because their report quote is not in the report (kept so nothing disappears unseen)
+    discarded: list[ReviewFinding] = []
+    versions: dict[str, int] = {}             # rule slug -> version reviewed (a newer version makes it out of date)
+    report_tokens: int = 0                    # estimated tokens of report text sent
+    cost_usd: float = 0.0
+    unpriced: bool = False                    # the model has no known price, so cost_usd is not an estimate
+
+
 # --------------------------------------------------------------------------- pipeline records
 class ReportMeta(BaseModel):
     source: str
@@ -363,3 +419,4 @@ class RunRecord(BaseModel):
     chains: list[ChainPackage] = []
     usage: Usage = Usage()
     warnings: list[str] = []
+    review: RunReview | None = None   # latest AI review (on request, see review.py)

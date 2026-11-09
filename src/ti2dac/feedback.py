@@ -25,6 +25,7 @@ CATEGORIES = {
     "not_a_behaviour": "Extracted item is an IOC/narrative, not a TTP",
     "missed_behaviour": "Important behaviour in the report was missed",
     "incorrect_attack_mapping": "Wrong ATT&CK technique or tactic",
+    "wrong_ioc": "IOC is truncated, mislabelled or not an indicator",
     "wrong_logsource": "Wrong Sigma logsource / telemetry",
     "wrong_field_name": "Field does not exist for the logsource or SIEM",
     "logic_error": "Rule would not match the described behaviour",

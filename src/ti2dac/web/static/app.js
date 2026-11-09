@@ -14,6 +14,16 @@
   }
   function $$(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
 
+  // ---------------------------------------------------------------- AI review: open the finding a link points to
+  function openFinding() {
+    var id = window.location.hash.slice(1);
+    if (id.indexOf("finding-") !== 0) return;
+    var el = document.getElementById(id);
+    if (el && el.tagName === "DETAILS") { el.open = true; el.scrollIntoView({ block: "center" }); }
+  }
+  window.addEventListener("hashchange", openFinding);
+  document.addEventListener("DOMContentLoaded", openFinding);
+
   // ---------------------------------------------------------------- theme
   function isDark() {
     var t = doc.getAttribute("data-theme");

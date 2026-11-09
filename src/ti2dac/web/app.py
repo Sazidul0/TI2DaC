@@ -11,6 +11,7 @@ Security posture (internal tool):
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -37,6 +38,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .. import __version__, aistatus, attack, health, modelchoice, obs
+from .. import review as review_mod
 from ..config import STAGES, Settings, env_file, env_source, set_env_secret
 from ..feedback import ARTIFACTS, CATEGORIES, REVIEW_STATES, SEVERITIES, TEST_RESULTS, Store, target_status
 from ..llm import LLM, verify_key
@@ -47,6 +49,20 @@ from ..users import Users
 from . import jobs as jobs_mod
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+_STATIC = Path(__file__).parent / "static"
+
+
+def _asset_version() -> str:
+    """Changes whenever a static file changes, so browsers never keep an old stylesheet or script after an
+    update (the package version alone does not change between UI edits)."""
+    h = hashlib.sha256()
+    for name in ("app.css", "app.js", "favicon.svg"):
+        try:
+            st = (_STATIC / name).stat()
+        except OSError:
+            continue
+        h.update(f"{name}:{st.st_mtime_ns}:{st.st_size}".encode())
+    return h.hexdigest()[:12]
 _MD = MarkdownIt("commonmark", {"html": False}).enable("table")   # raw HTML in generated docs is escaped
 TEMPLATES.env.filters["md"] = lambda s: Markup(_MD.render(s or ""))
 
@@ -137,7 +153,7 @@ class _Security(BaseHTTPMiddleware):
 def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(title="ti2dac", version=__version__, docs_url=None, redoc_url=None,
                   description="Threat intel → Sigma → multi-SIEM detection packages. HTTP Basic auth when users are configured.")
-    app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
+    app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
     store = Store(settings.db_path)
     app.add_middleware(_Security, users=Users(settings.state_dir), user=os.environ.get("TI2DAC_WEB_USER"),
                        password=os.environ.get("TI2DAC_WEB_PASSWORD"), store=store)
@@ -194,7 +210,7 @@ def create_app(settings: Settings) -> FastAPI:
             "cost_total": st.get("cost_total_usd", 0),
             "blocked": aistatus.block_reason(settings.state_dir, prov, settings.ai.daily_request_limit)
             if settings.ai.enabled else "",
-            "models": {k: getattr(settings.ai, k).model for k in ("analyze", "generate", "repair", "translate")},
+            "models": {k: getattr(settings.ai, k).model for k in STAGES},
         }
 
     def ai_blocked() -> str:
@@ -202,7 +218,7 @@ def create_app(settings: Settings) -> FastAPI:
             if settings.ai.enabled else ""
 
     def ctx(request: Request, **kw):
-        return {"request": request, "user": request.state.user, "role": request.state.role, "version": __version__,
+        return {"request": request, "user": request.state.user, "role": request.state.role, "version": __version__, "asset_v": _asset_version(),
                 "ai_enabled": settings.ai.enabled, "ai": ai_info(), **kw}
 
     def start_job(fn, kw: dict, label: str, actor: str) -> str:
@@ -225,10 +241,13 @@ def create_app(settings: Settings) -> FastAPI:
             r["approved"] = sum(p.get("review_status") == "approved" for p in pkgs)
             r["kind"] = (data.get("report") or {}).get("kind", "")
             r["tlp"] = (data.get("report") or {}).get("tlp_effective", "")
+            r["review"] = review_mod.status(data)
         siems = [(TARGETS[t].label, TARGETS[t].language, False) for t in settings.targets if t in TARGETS]
         siems += [(*LLM_TARGET_LABELS.get(t, (t, "")), True) for t in settings.llm_targets]
+        reviewing = {j["label"].split(": AI review", 1)[0] for j in store.list_jobs(100)
+                     if j["status"] == "running" and ": AI review" in j["label"]}
         return TEMPLATES.TemplateResponse(request, "index.html", ctx(request, runs=runs, jobs=store.list_jobs(5), deleted=deleted,
-                                                                     siems=siems))
+                                                                     siems=siems, reviewing=reviewing))
 
     @app.post("/runs")
     async def create_run(request: Request, url: str = Form(""), count: int = Form(3), select: str = Form(""),
@@ -294,7 +313,98 @@ def create_app(settings: Settings) -> FastAPI:
                         for p in record.packages if (path / "simulations" / p.slug / "README.md").is_file()},
             ads={p.slug: (path / "documentation" / f"{p.slug}-ads.md").read_text()
                  for p in record.packages if (path / "documentation" / f"{p.slug}-ads.md").is_file()},
+            review=record.review, review_state=review_mod.status(record.model_dump()),
+            review_changes=review_mod.out_of_date(record), review_choices=review_choices(record),
+            review_running=review_running(run_id), finding_rule={f.id: review_mod.rule_of(record, f)
+                                                                for f in (record.review.findings if record.review else [])},
         ))
+
+    # ------------------------------------------------------------------ AI review of a run
+    def review_running(run_id: str) -> bool:
+        return any((store.get_job(j) or {}).get("label", "").startswith(f"{run_id}: AI review")
+                   for j in store.running_jobs_for(run_id))
+
+    def review_choices(record) -> dict:
+        """Models the review form offers, per provider, with a price estimate; why a provider is unavailable."""
+        tokens_in = review_mod.estimate_tokens(record, settings)
+        groups = []
+        for prov, label in modelchoice.PROVIDER_LABELS.items():
+            why = (review_mod.policy_problem(record, settings, prov)
+                   or ("no API key configured" if aistatus.key_status(prov) == "not configured" else "")
+                   or aistatus.block_reason(settings.state_dir, prov, settings.ai.daily_request_limit))
+            groups.append({"provider": prov, "label": label, "why": why, "models": [
+                {"value": f"{prov}:{m['id']}", "name": m["name"], "cost": review_mod.estimate_cost(tokens_in, m["id"], settings)}
+                for m in modelchoice.available(settings, prov)]})
+        default = f"{settings.ai.provider}:{settings.ai.review.model}"
+        usable = {m["value"] for g in groups if not g["why"] for m in g["models"]}
+        return {"groups": groups, "default": default if default in usable else "code", "tokens_in": tokens_in}
+
+    @app.post("/runs/{run_id}/ai-review")
+    def start_review(request: Request, run_id: str, model: str = Form("code")):
+        """Review the run's outputs against its report. `model`: "code" (ti2dac's checks only, free) or
+        "<provider>:<model id>", e.g. `anthropic:claude-opus-5-5`. Runs as a background job; changes nothing in the run."""
+        path = run_dir(run_id)
+        if review_running(run_id):
+            raise HTTPException(409, "a review of this run is already running")
+        provider, model_id = "", ""
+        if model != "code":
+            provider, _, model_id = model.partition(":")
+            if provider not in modelchoice.PROVIDER_LABELS:
+                raise HTTPException(400, f"unknown provider {provider!r}")
+            if model_id not in {m["id"] for m in modelchoice.available(settings, provider)}:
+                raise HTTPException(400, f"{model_id!r} is not a {modelchoice.PROVIDER_LABELS[provider]} model ti2dac knows")
+            problem = review_mod.policy_problem(load_record(path), settings, provider)
+            if problem:
+                raise HTTPException(403, problem)
+            if aistatus.key_status(provider) == "not configured":
+                raise HTTPException(400, f"no API key for {modelchoice.PROVIDER_LABELS[provider]}: add one on the AI page")
+            if aistatus.block_reason(settings.state_dir, provider, settings.ai.daily_request_limit):
+                return RedirectResponse("/ai?blocked=1", 303)
+        user = request.state.user
+        kw = {"run_id": run_id, "path": str(path), "provider": provider, "model": model_id, "actor": user}
+        label = f"{run_id}: AI review ({model_id or 'code checks only'})"
+        return RedirectResponse(f"/jobs/{start_job(jobs_mod.ai_review, kw, label, user)}", 303)
+
+    @app.post("/runs/{run_id}/ai-review/{fid}")
+    def decide_finding(request: Request, run_id: str, fid: str, decision: str = Form(...), note: str = Form("")):
+        """Accept, dismiss or reopen one review finding. Accepting a rule, query or simulation finding opens
+        feedback on that rule (fix it from there); accepting an analysis or IOC finding adds a run warning."""
+        if decision not in ("accepted", "dismissed", "open"):
+            raise HTTPException(400, "decision must be accepted, dismissed or open")
+        path = run_dir(run_id)
+        user = request.state.user
+        with run_lock(run_id):
+            record = load_record(path)
+            try:
+                f = review_mod.finding(record, fid)
+            except LookupError as e:
+                raise HTTPException(404, str(e))
+            warning = review_mod.warning_text(f)
+            if decision == "accepted" and f.status != "accepted":
+                slug = review_mod.rule_of(record, f)
+                if slug and not f.feedback_id:
+                    pkg = next(p for p in record.packages if p.slug == slug)
+                    artifact = ("attack_mapping" if f.category == "incorrect_attack_mapping"
+                                else review_mod.ARTIFACT[f.area])
+                    f.feedback_id = store.add_feedback(
+                        reviewer=user, run_id=run_id, slug=slug, rule_id=pkg.rule_id, rule_version=pkg.version,
+                        artifact=artifact, category=f.category, severity=f.severity,
+                        comment=review_mod.feedback_comment(f, record.review), target=f.siem)
+                    f.note = f"feedback #{f.feedback_id} opened on {slug}" + (f"; {note.strip()}" if note.strip() else "")
+                elif not slug:
+                    if warning not in record.warnings:
+                        record.warnings.append(warning)
+                    f.note = note.strip()
+            elif decision != "accepted":
+                if warning in record.warnings:   # reopened or dismissed after it was accepted
+                    record.warnings.remove(warning)
+                f.note = note.strip() if decision == "dismissed" else f.note
+            f.status, f.decided_by = decision, user if decision != "open" else ""
+            f.decided_at = datetime.now().astimezone().isoformat(timespec="seconds") if decision != "open" else ""
+            rerender(record, path)
+        store.audit(user, "run.ai_review.decide", {"run_id": run_id, "finding": fid, "decision": decision,
+                                                   "feedback_id": f.feedback_id})
+        return RedirectResponse(f"/runs/{run_id}#finding-{fid}", 303)
 
     @app.post("/runs/{run_id}/delete")
     def delete_run(request: Request, run_id: str):
@@ -477,7 +587,7 @@ def create_app(settings: Settings) -> FastAPI:
         return PlainTextResponse(target.read_text(errors="replace"))
 
     @app.get("/ai", response_class=HTMLResponse, include_in_schema=False)
-    def ai_page(request: Request, blocked: int = 0):
+    def ai_page(request: Request, blocked: int = 0, stages: int = 0):
         keys = []
         for prov, (var, label) in KEY_VARS.items():
             val = os.environ.get(var, "")
@@ -498,7 +608,8 @@ def create_app(settings: Settings) -> FastAPI:
                            "msg": model_msgs.get(prov)})
         return TEMPLATES.TemplateResponse(request, "ai.html", ctx(
             request, just_blocked=bool(blocked), keys=keys, env_path=str(env_file().resolve()), insecure=insecure,
-            model_blocks=blocks, model_locks=modelchoice.env_locks(), model_choice=choice, stages=STAGES))
+            model_blocks=blocks, model_locks=modelchoice.env_locks(), model_choice=choice, stages=STAGES,
+            open_stages=bool(stages)))
 
     @app.post("/ai/models")
     async def ai_models(request: Request):

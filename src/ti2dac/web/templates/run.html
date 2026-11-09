@@ -58,10 +58,10 @@
 <div class="stack">
 
   {# ---------------------------------------------------------------- overview #}
-  <section class="card" id="overview" aria-labelledby="ov-title">
+  <section class="card" data-sec="overview" id="overview" aria-labelledby="ov-title">
     <div class="card-head"><h2 id="ov-title">{{ ui.icon("file") }}Overview</h2></div>
     <div class="card-body stack">
-      {% if r.analysis and r.analysis.summary %}<p style="margin:0;font-size:14px;line-height:1.65">{{ r.analysis.summary }}</p>{% endif %}
+      {% if r.analysis and r.analysis.summary %}<p class="lead">{{ r.analysis.summary }}</p>{% endif %}
       {% if r.warnings %}
       <div class="alert warn">{{ ui.icon("alert") }}<div style="min-width:0;flex:1"><details class="plain" {{ 'open' if r.warnings|length <= 2 }}>
         <summary><span class="alert-title" style="color:var(--fg);margin:0">{{ r.warnings|length }} warning(s) from this run</span>{{ ui.icon("chevron-right", "sm chev") }}</summary>
@@ -108,8 +108,105 @@
     </div>
   </section>
 
+  {# ---------------------------------------------------------------- AI review #}
+  <section class="card" data-sec="review" id="ai-review" aria-labelledby="rv-title">
+    <div class="card-head"><div>
+      <h2 id="rv-title">{{ ui.icon("shield") }}AI review {{ ui.review_badge(review_state, review_running) }}</h2>
+      <p class="desc">A second opinion on this run, checked against the report. Nothing changes until you accept a finding.</p></div></div>
+    <div class="card-body stack">
+      {% if review_changes %}<div class="alert warn">{{ ui.icon("alert") }}<div><div class="alert-title">Out of date</div>
+        Changed since this review: {{ review_changes|join(", ") }}. Review again to check the new versions.</div></div>{% endif %}
+      {% if review_running %}<div class="alert info">{{ ui.icon("clock") }}<div>A review of this run is running. Reload the page when it has finished.</div></div>{% endif %}
+
+      {% if review %}
+      <div class="row" style="gap:6px 14px">
+        <span class="xs muted">{{ ui.icon("clock", "sm") }} {{ ui.short_date(review.created_at) }}{% if review.created_by %} · {{ review.created_by }}{% endif %}</span>
+        <span class="xs muted">{% if review.provider %}{{ ui.icon("ai", "sm") }} <code>{{ review.model }}</code>{% if review.unpriced %} · not priced{% else %} · est. ${{ "%.4f"|format(review.cost_usd) }}{% endif %}
+          {% else %}ti2dac checks only (no AI call){% endif %}</span>
+        <span class="xs muted">{{ review.findings|length }} finding(s){% if review.discarded %} · {{ review.discarded|length }} discarded{% endif %}</span>
+      </div>
+      {% if review.summary %}<p class="lead">{{ review.summary }}</p>{% endif %}
+      {% if not review.findings %}{{ ui.empty("No mistakes found", "Neither the checks nor the reviewer found a problem with this run.", "check-circle") }}{% endif %}
+
+      <div class="findings">
+      {% for area, label in [("rule", "Rules"), ("query", "SIEM queries"), ("simulation", "Simulations"), ("ioc", "IOCs"), ("analysis", "Analysis")] %}
+      {%- set fs = review.findings|selectattr("area", "equalto", area)|list -%}
+      {% if fs %}
+        <div class="group">
+          <div class="section-title">{{ label }} <span class="badge muted">{{ fs|length }}</span></div>
+          {% for f in fs %}{%- set slug = finding_rule.get(f.id) -%}
+          <details class="finding sev-{{ f.severity }} {{ 'decided' if f.status != 'open' }}" id="finding-{{ f.id }}">
+            <summary>
+              {{ ui.icon("chevron-right", "sm chev") }}
+              <span class="badge sq {{ ui.tone(f.severity) }}">{{ f.severity }}</span>
+              <span class="f-target">{{ f.target }}{% if f.siem %} · {{ f.siem }}{% endif %}</span>
+              <span class="f-problem">{{ f.problem }}</span>
+              {% if f.status != "open" %}{{ ui.status(f.status, "ok" if f.status == "accepted" else "muted") }}{% endif %}
+              <span class="badge sq muted mono" title="{{ 'Found by ti2dac code (deterministic)' if f.source == 'code' else 'Found by the reviewer model' }}">{{ f.id }} · {{ "ti2dac" if f.source == "code" else "AI" }}</span>
+            </summary>
+            <div class="f-body">
+              <div class="xs muted">{{ categories.get(f.category, f.category) }}{% if slug %} · <a href="#{{ slug }}">open {{ slug }}</a>{% endif %}</div>
+              <p>{{ f.problem }}</p>
+              {% if f.report_quote %}<blockquote>{% if f.quote_verified %}<span class="ok" title="Found in the report">{{ ui.icon("check", "sm") }}</span> {% endif %}<q>{{ f.report_quote }}</q></blockquote>{% endif %}
+              {% if f.suggested_fix %}<div class="f-fix"><b>Suggested fix:</b> {{ f.suggested_fix }}</div>{% endif %}
+              {% if f.status == "open" %}
+              <form method="post" action="/runs/{{ r.run_id }}/ai-review/{{ f.id }}" class="f-actions">
+                <input class="input sm" name="note" placeholder="Note (why, if dismissing)" aria-label="Note for {{ f.id }}">
+                <button class="btn sm" name="decision" value="accepted" title="{{ 'Opens feedback on ' ~ slug if slug else 'Adds it to the run warnings' }}">{{ ui.icon("check", "sm") }}Accept{{ " → feedback on " ~ slug if slug }}</button>
+                <button class="btn outline sm" name="decision" value="dismissed">{{ ui.icon("x", "sm") }}Dismiss</button>
+              </form>
+              {% else %}
+              <div class="f-actions">
+                <span class="xs muted">{{ f.status|capitalize }} by {{ f.decided_by or "-" }}{% if f.decided_at %} · {{ ui.short_date(f.decided_at) }}{% endif %}
+                  {% if f.note %} · {% if f.feedback_id and slug %}<a href="#{{ slug }}">{{ f.note }}</a>{% else %}{{ f.note }}{% endif %}{% endif %}</span>
+                <form method="post" action="/runs/{{ r.run_id }}/ai-review/{{ f.id }}"><button class="btn ghost sm" name="decision" value="open">Reopen</button></form>
+              </div>
+              {% endif %}
+            </div>
+          </details>
+          {% endfor %}
+        </div>
+      {% endif %}
+      {% endfor %}
+      </div>
+
+      {% if review.discarded %}
+      <details class="plain"><summary>{{ ui.icon("chevron-right", "sm chev") }}{{ review.discarded|length }} AI finding(s) discarded: their quote is not in the report</summary>
+        <p class="xs muted" style="margin:8px 0">A finding that rests on the report must quote it word for word. These quotes were not found, so the reviewer may have
+          misread or invented them. They are kept here so nothing disappears unseen.</p>
+        <ul class="xs">{% for f in review.discarded %}<li><b>{{ f.target }}{% if f.siem %} · {{ f.siem }}{% endif %}</b>: {{ f.problem }}
+          {% if f.report_quote %}<div class="muted">Quoted: <q>{{ f.report_quote }}</q></div>{% endif %}<div class="muted">{{ f.note }}</div></li>{% endfor %}</ul>
+      </details>{% endif %}
+      {% else %}
+      {{ ui.empty("Not reviewed yet", "Pick a reviewer below. A different model from the one that wrote the rules gives a more independent opinion.", "shield") }}
+      {% endif %}
+
+      <form method="post" action="/runs/{{ r.run_id }}/ai-review" data-busy class="review-run">
+        <label class="field"><span>Reviewer</span>
+          <select class="select" name="model">
+            <option value="code" {{ 'selected' if review_choices.default == 'code' }}>ti2dac checks only · free, no AI call</option>
+            {% for g in review_choices.groups %}<optgroup label="{{ g.label }}{{ ' · unavailable: ' ~ g.why if g.why }}">
+              {% for m in g.models %}<option value="{{ m.value }}" {{ 'disabled' if g.why }} {{ 'selected' if m.value == review_choices.default }}>{{ m.name }}
+                · {{ ("~$%.2f"|format(m.cost)) if m.cost is not none else "price unknown" }}{% if m.value.split(":", 1)[1] == r.ai_models.get("generate") %} · wrote these rules{% endif %}</option>{% endfor %}
+            </optgroup>{% endfor %}
+          </select></label>
+        <button class="btn" type="submit" {{ 'disabled' if review_running }}><span class="spin"></span><span class="ico-default">{{ ui.icon("shield", "sm") }}</span>{{ "Review again" if review else "Review this run" }}</button>
+      </form>
+      <details class="plain"><summary>{{ ui.icon("chevron-right", "sm chev") }}How the review works</summary>
+        <ul class="xs muted" style="margin:10px 0 0;line-height:1.6">
+          <li>ti2dac's own checks run first and cost nothing. Then the model you pick reads the report (about {{ review_choices.tokens_in|tok }} input tokens) and this run's
+            rules, simulations, test events and AI-translated queries.</li>
+          <li>A finding that rests on the report must quote it; findings whose quote is not in the report are discarded.</li>
+          <li>Accepting a rule, query or simulation finding opens feedback on that rule; accepting an analysis or IOC finding adds a run warning.</li>
+          <li>Decisions are kept: a finding raised again word for word keeps its decision, and dismissed findings are passed to the next review.</li>
+          <li>The default reviewer is the <code>review</code> stage on the <a href="/ai?stages=1#stage-models">AI page</a>.</li>
+        </ul>
+      </details>
+    </div>
+  </section>
+
   {# ---------------------------------------------------------------- behaviours #}
-  <section class="card" id="behaviours" aria-labelledby="bh-title">
+  <section class="card" data-sec="behaviours" id="behaviours" aria-labelledby="bh-title">
     <div class="card-head">
       <div><h2 id="bh-title">{{ ui.icon("list") }}Behaviours <span class="badge muted">{{ r.behaviours|length }}</span></h2>
         <p class="desc">TTPs extracted from the report, ranked by how detectable, reproducible and low-noise they are.
@@ -128,7 +225,7 @@
           <td class="shrink"><span class="badge sq muted mono">{{ b.id }}</span></td>
           <td style="min-width:280px">
             <div class="cell-title">{{ b.name }}</div>
-            <div class="cell-sub" style="font-size:12.5px">{{ b.description }}</div>
+            <div class="cell-sub clamp-2" style="font-size:12.5px" title="{{ b.description }}">{{ b.description }}</div>
             {% if b.evidence %}
             <details class="plain evidence"><summary>{{ ui.icon("chevron-right", "sm chev") }}Evidence
               <span class="badge {{ 'ok' if v == b.evidence|length else 'bad' if v == 0 else 'warn' }}" style="height:19px;font-size:11px">{{ v }}/{{ b.evidence|length }} verified</span></summary>
@@ -168,7 +265,7 @@
   {%- set trs = results|selectattr("slug", "equalto", p.slug)|list -%}
   {%- set q_ok = p.queries|selectattr("query")|list|length -%}
   {%- set ls = p.draft.sigma.logsource -%}
-  <section class="card rule" id="{{ p.slug }}" aria-labelledby="t-{{ p.slug }}">
+  <section class="card rule" data-sec="rules" id="{{ p.slug }}" aria-labelledby="t-{{ p.slug }}">
     <div class="rule-head">
       <div style="min-width:0;flex:1 1 380px">
         <span class="slug">{{ ui.icon("target", "sm") }}{{ p.slug }} · v{{ p.version }}</span>
@@ -194,13 +291,13 @@
       {% if p.selftest == "fail" %}{% for d in p.selftest_details %}<li>self-test: {{ d }}</li>{% endfor %}{% endif %}
       {% if p.sim_blocked %}<li>simulation blocked by safety linter</li>{% endif %}
     </ul></div></div></div>{% endif %}
-    {% if p.quality_warnings %}
-    <div class="issues"><div class="alert warn">{{ ui.icon("alert") }}<div><div class="alert-title">Quality warnings</div><ul>
-      {% for w in p.quality_warnings %}<li>{{ w }}</li>{% endfor %}</ul></div></div></div>{% endif %}
-    {% if p.similar_rules %}
-    <div class="issues"><div class="alert info">{{ ui.icon("duplicate") }}<div style="min-width:0">
-      <details class="plain"><summary><span class="alert-title" style="color:var(--fg);margin:0">Possible duplicate of {{ p.similar_rules|length }} existing rule(s)</span>{{ ui.icon("chevron-right", "sm chev") }}</summary>
-      <ul>{% for s in p.similar_rules %}<li style="word-break:break-word">{{ s }}</li>{% endfor %}</ul></details></div></div></div>{% endif %}
+    {% if p.quality_warnings or p.similar_rules %}
+    <div class="rule-notes">
+      {% if p.quality_warnings %}<details class="warn"><summary>{{ ui.icon("alert", "sm") }}{{ p.quality_warnings|length }} quality warning{{ "s" if p.quality_warnings|length > 1 }}{{ ui.icon("chevron-right", "sm chev") }}</summary>
+        <ul>{% for w in p.quality_warnings %}<li>{{ w }}</li>{% endfor %}</ul></details>{% endif %}
+      {% if p.similar_rules %}<details class="info"><summary>{{ ui.icon("duplicate", "sm") }}{{ p.similar_rules|length }} possible duplicate{{ "s" if p.similar_rules|length > 1 }}{{ ui.icon("chevron-right", "sm chev") }}</summary>
+        <ul>{% for x in p.similar_rules %}<li style="word-break:break-word">{{ x }}</li>{% endfor %}</ul></details>{% endif %}
+    </div>{% endif %}
 
     {% if notice and notice.slug == p.slug %}
     <div class="issues" role="status">
@@ -376,7 +473,7 @@
   {% endfor %}
 
   {% if r.chains %}
-  <section class="card" id="chains" aria-labelledby="ch-title">
+  <section class="card" data-sec="chains" id="chains" aria-labelledby="ch-title">
     <div class="card-head"><div><h2 id="ch-title">{{ ui.icon("layers") }}Multi-event chains</h2>
       <p class="desc">Rules above joined into one detection by ti2dac code (Sigma correlation plus fixed query templates). The AI never writes the join.
         Add one with <code>ti2dac chain {{ r.run_id }} rule-001 rule-002 --within 10m --on host</code>.</p></div></div>
@@ -405,12 +502,13 @@
 
 <aside class="rail" aria-label="On this page">
   <div class="section-title">On this page</div>
-  <a href="#overview">{{ ui.icon("file", "sm") }}<span class="t">Overview</span></a>
-  <a href="#behaviours">{{ ui.icon("list", "sm") }}<span class="t">Behaviours</span></a>
+  <a href="#overview" data-sec="overview">{{ ui.icon("file", "sm") }}<span class="t">Overview</span></a>
+  <a href="#ai-review" data-sec="review">{{ ui.icon("shield", "sm") }}<span class="t">AI review{% if review_state.open %} ({{ review_state.open }} open){% endif %}</span></a>
+  <a href="#behaviours" data-sec="behaviours">{{ ui.icon("list", "sm") }}<span class="t">Behaviours</span></a>
   {% if r.packages %}<div class="group"><div class="section-title">Rules</div>
   {% for p in r.packages %}<a href="#{{ p.slug }}" title="{{ p.draft.sigma.title }}"><span class="dot {{ ui.tone(p.review_status) }}"></span><span class="t">{{ p.draft.sigma.title }}</span></a>{% endfor %}
   </div>{% endif %}
-  {% if r.chains %}<a href="#chains">{{ ui.icon("layers", "sm") }}<span class="t">Multi-event chains ({{ r.chains|length }})</span></a>{% endif %}
+  {% if r.chains %}<a href="#chains" data-sec="chains">{{ ui.icon("layers", "sm") }}<span class="t">Multi-event chains ({{ r.chains|length }})</span></a>{% endif %}
 </aside>
 </div>
 {% endblock %}

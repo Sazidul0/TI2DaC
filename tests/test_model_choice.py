@@ -72,7 +72,8 @@ def test_web_ai_page_switches_model_live(settings):
     assert r.status_code == 303 and r.headers["location"] == "/ai#models"
     status = client.get("/api/ai-status").json()
     assert status["models"] == {"analyze": "claude-sonnet-5-5", "generate": "claude-opus-5-5",
-                                "repair": "claude-sonnet-5-5", "translate": "claude-sonnet-5-5"}
+                                "repair": "claude-sonnet-5-5", "translate": "claude-sonnet-5-5",
+                                "review": "claude-sonnet-5-5"}
     assert "Saved: Claude (Anthropic) is the active provider" in client.get("/ai").text
     client.post("/ai/models", data={"provider": "gemini", "model": "gemini-flash-latest"})
     assert client.get("/api/ai-status").json()["provider"] == "gemini"
@@ -80,6 +81,21 @@ def test_web_ai_page_switches_model_live(settings):
     client.post("/ai/models", data={"provider": "anthropic", "model": "not-a-model"})
     assert client.get("/api/ai-status").json()["provider"] == "gemini"            # rejected, nothing changed
     assert "not a Claude (Anthropic) model" in client.get("/ai").text
+
+
+def test_web_ai_page_links_to_per_stage_editor(settings):
+    """The read-only 'Models per stage' list links to the editor, which opens when reached through that link."""
+    import re
+
+    from ti2dac.web.app import create_app
+
+    client = TestClient(create_app(settings))
+    page = client.get("/ai").text
+    assert 'href="/ai?stages=1#stage-models"' in page
+    editor = re.search(r'<details[^>]*id="stage-models"[^>]*>', page)
+    assert editor and " open" not in editor.group(0)                     # collapsed by default
+    opened = re.search(r'<details[^>]*id="stage-models"[^>]*>', client.get("/ai?stages=1").text)
+    assert opened and " open" in opened.group(0)
 
 
 def test_cli_model_command(settings, monkeypatch, tmp_path):

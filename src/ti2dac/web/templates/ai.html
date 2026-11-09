@@ -94,14 +94,16 @@
         <input type="hidden" name="provider" value="{{ b.provider }}">
         <label class="field"><span>Model for every stage</span>
           <select class="select" name="model">{% for m in b.models %}<option value="{{ m.id }}" {{ 'selected' if m.id == b.main }}>{{ m.name }} · {{ m.price }}{% if m.unlisted %} · not in this key's list{% endif %}</option>{% endfor %}</select></label>
-        <details class="plain" style="margin-top:10px" {{ 'open' if b.stages.values()|select|list }}>
+        <details class="plain" style="margin-top:10px" {% if b.active %}id="stage-models"{% endif %}
+                 {{ 'open' if b.stages.values()|select|list or (open_stages and b.active) }}>
           <summary>{{ ui.icon("chevron-right", "sm chev") }}Different model per stage</summary>
           <div class="form-grid" style="margin-top:10px">
           {% for st in stages %}<label class="field"><span>{{ st|capitalize }} <span class="help">· effort {{ b.effort[st] }}</span></span>
             <select class="select sm" name="stage_{{ st }}"><option value="">Same as above</option>{% for m in b.models %}<option value="{{ m.id }}" {{ 'selected' if m.id == b.stages[st] }}>{{ m.name }}</option>{% endfor %}</select></label>{% endfor %}
           </div>
           <p class="xs muted" style="margin:8px 0 0">Analyse reads the report once; generate writes each rule, where quality matters most;
-            repair and translate are small follow-up calls that a cheaper model often handles well.</p>
+            repair and translate are small follow-up calls that a cheaper model often handles well. Review is the default for a run's
+            AI review (any model can be picked per review); a model other than generate's gives a more independent second opinion.</p>
         </details>
         <div class="form-actions">
           <button class="btn">{{ ui.icon("check", "sm") }}{{ "Save" if b.active else "Use " ~ b.label }}</button>
@@ -143,7 +145,9 @@
         {% if ai.last_success %}<dt>Last success</dt><dd>{{ ai.last_success }}</dd>{% endif %}
         {% if ai.message %}<dt>Last error</dt><dd><code>{{ ai.message }}</code></dd>{% endif %}
       </dl>
-      <div><div class="section-title">Models per stage</div>
+      <div><div class="row" style="justify-content:space-between"><div class="section-title">Models per stage</div>
+          {% if role == "admin" %}<a class="xs" href="/ai?stages=1#stage-models">Change per stage {{ ui.icon("arrow-right", "sm") }}</a>
+          {% else %}<span class="xs muted">Only admins can change these</span>{% endif %}</div>
         <div class="models">{% for k, v in ai.models.items() %}<div><div class="k">{{ k }}</div><code>{{ v }}</code></div>{% endfor %}</div></div>
       {% if ai.blocked %}<div class="alert bad">{{ ui.icon("pause") }}<div><div class="alert-title">{{ ai.blocked }}</div>
         While paused, nothing is sent to the provider: repeated requests after a "quota exhausted" answer waste quota and can be treated as
