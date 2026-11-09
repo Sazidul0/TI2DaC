@@ -1,3 +1,20 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Sazidul0/TI2DaC/main/docs/ti2dac-banner.svg" alt="ti2dac: Threat Intelligence to Detection-as-Code" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://pypi.org/project/ti2dac/"><img src="https://img.shields.io/pypi/v/ti2dac?label=PyPI&color=1f4e79" alt="PyPI version"></a>
+  <a href="https://pypi.org/project/ti2dac/"><img src="https://img.shields.io/pypi/pyversions/ti2dac" alt="Python versions"></a>
+  <a href="https://github.com/Sazidul0/TI2DaC/actions/workflows/ci.yml"><img src="https://github.com/Sazidul0/TI2DaC/actions/workflows/ci.yml/badge.svg" alt="Build status"></a>
+  <a href="https://github.com/Sazidul0/TI2DaC/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Sazidul0/TI2DaC" alt="License"></a>
+  <a href="https://github.com/Sazidul0/TI2DaC/stargazers"><img src="https://img.shields.io/github/stars/Sazidul0/TI2DaC?style=flat" alt="GitHub stars"></a>
+  <a href="https://github.com/Sazidul0/TI2DaC/issues"><img src="https://img.shields.io/github/issues/Sazidul0/TI2DaC" alt="GitHub issues"></a>
+</p>
+
+**Open-source Threat Intelligence to Detection-as-Code engine.** ti2dac turns threat reports and incident write-ups into evidence-checked Sigma rules, native queries for Splunk, Elastic, Sentinel, Defender, CrowdStrike, QRadar, OpenSearch, Loki and Wazuh, and safe simulation and test guides, so blue teams can go from a report to a reviewed detection package in minutes.
+
+`sigma` · `detection-as-code` · `threat-intelligence` · `mitre-attack` · `siem` · `splunk` · `elastic` · `microsoft-sentinel` · `wazuh` · `blue-team` · `detection-engineering` · `llm`
+
 # ti2dac: Threat Intelligence → Detection-as-Code
 
 ti2dac turns a **threat-intelligence report or an internal incident report** into a reviewed, tested detection package:
@@ -70,20 +87,20 @@ cited ATT&CK IDs, and validation, conversion, unit tests and replay of hand-writ
 - **Nothing is trusted unchecked.** Evidence quotes, ATT&CK IDs, Sigma syntax and rule self-tests are verified by code before you see a rule.
 - **People stay in charge.** The tool drafts. A second person (the approver) must approve what the author created, and only approved rules are exported.
 
-Generated rules are drafts until you have tested them on real events. See [known limitations](https://github.com/Sazidul0/TI2DaC/blob/main/docs/known-limitations.md).
+Generated rules are drafts until you have tested them on real events. See [known limitations](docs/known-limitations.md).
 
 ## Documentation
 
 | Guide | What is in it |
 |---|---|
-| [Getting started](https://github.com/Sazidul0/TI2DaC/blob/main/docs/getting-started.md) | AI provider setup, a step-by-step walk-through, supported inputs |
-| [How it works](https://github.com/Sazidul0/TI2DaC/blob/main/docs/how-it-works.md) | Architecture in plain terms, the working process, how tokens are kept low |
-| [Quality, safety and testing](https://github.com/Sazidul0/TI2DaC/blob/main/docs/quality-and-testing.md) | Safety controls and the three levels of proving a rule works |
-| [SIEM coverage](https://github.com/Sazidul0/TI2DaC/blob/main/docs/siem-coverage.md) | All SIEM targets, Wazuh, correlations and client profiles |
-| [Review and configuration](https://github.com/Sazidul0/TI2DaC/blob/main/docs/governance-and-config.md) | Feedback, four-eyes approval, Git hand-off, `ti2dac.yaml` |
-| [Operations](https://github.com/Sazidul0/TI2DaC/blob/main/docs/operations.md) | Monitoring, web UI security, output package layout |
-| [CLI reference](https://github.com/Sazidul0/TI2DaC/blob/main/docs/cli-reference.md) | Every command |
-| [Known limitations](https://github.com/Sazidul0/TI2DaC/blob/main/docs/known-limitations.md) | What the tool does not do yet |
+| [Getting started](docs/getting-started.md) | AI provider setup, a step-by-step walk-through, supported inputs |
+| [How it works](docs/how-it-works.md) | Architecture in plain terms, the working process, how tokens are kept low |
+| [Quality, safety and testing](docs/quality-and-testing.md) | Safety controls and the three levels of proving a rule works |
+| [SIEM coverage](docs/siem-coverage.md) | The 14 targets, Wazuh, correlations and client profiles |
+| [Review and configuration](docs/governance-and-config.md) | Feedback, four-eyes approval, Git hand-off, `ti2dac.yaml` |
+| [Operations](docs/operations.md) | Monitoring, web UI security, output package layout |
+| [CLI reference](docs/cli-reference.md) | Every command |
+| [Known limitations](docs/known-limitations.md) | What the tool does not do yet |
 
 ## Development
 
@@ -97,4 +114,4 @@ parser needs. `pySigma-backend-sqlite` must be `0.2.0`. `regex` and `dateparser`
 
 ## License
 
-MIT. See [LICENSE](https://github.com/Sazidul0/TI2DaC/blob/main/LICENSE).
+MIT. See [LICENSE](LICENSE).

@@ -11,13 +11,18 @@ requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Sazidul0" }]
-keywords = ["threat-intelligence", "sigma", "detection-as-code", "siem", "splunk", "elasticsearch", "security"]
+keywords = ["threat-intelligence", "sigma", "detection-as-code", "mitre-attack", "siem", "splunk", "elastic", "microsoft-sentinel", "wazuh", "blue-team", "detection-engineering", "llm", "security"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Information Technology",
+    "Intended Audience :: Developers",
+    "Environment :: Console",
+    "Environment :: Web Environment",
     "Topic :: Security",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.12",
     "Operating System :: OS Independent",
 ]
 dependencies = [
